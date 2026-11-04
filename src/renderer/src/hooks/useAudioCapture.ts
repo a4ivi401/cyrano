@@ -131,6 +131,20 @@ export function useAudioCapture({ enabled, settings, paused }: UseAudioCaptureOp
     const cleanups: Array<() => void> = [];
     activeFlushHandlersRef.current = [];
 
+    const handleBeforeUnload = () => {
+      disposed = true;
+      activeFlushHandlersRef.current = [];
+      cleanups.forEach((fn) => {
+        try {
+          fn();
+        } catch {}
+      });
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    cleanups.push(() => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    });
+
     const sendChunkToMain = async (samples: Float32Array, source: AudioSourceType): Promise<string> => {
       const api = window.electronAPI;
       if (disposed || !api) return '';
@@ -387,6 +401,16 @@ export function useAudioCapture({ enabled, settings, paused }: UseAudioCaptureOp
           sysStream = null;
         }
 
+        if (sysStream) {
+          cleanups.push(() => {
+            sysStream?.getTracks().forEach((t) => {
+              try {
+                t.stop();
+              } catch {}
+            });
+          });
+        }
+
         if (disposed) {
           sysStream?.getTracks().forEach((t) => t.stop());
           return;
@@ -413,6 +437,16 @@ export function useAudioCapture({ enabled, settings, paused }: UseAudioCaptureOp
               },
               video: false
             });
+
+            if (fallbackStream) {
+              cleanups.push(() => {
+                fallbackStream?.getTracks().forEach((t) => {
+                  try {
+                    t.stop();
+                  } catch {}
+                });
+              });
+            }
 
             if (disposed) {
               fallbackStream.getTracks().forEach((t) => t.stop());
@@ -455,6 +489,16 @@ export function useAudioCapture({ enabled, settings, paused }: UseAudioCaptureOp
             },
             video: false
           });
+
+          if (micStream) {
+            cleanups.push(() => {
+              micStream?.getTracks().forEach((t) => {
+                try {
+                  t.stop();
+                } catch {}
+              });
+            });
+          }
 
           if (disposed) {
             micStream.getTracks().forEach((t) => t.stop());

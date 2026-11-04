@@ -68,6 +68,11 @@ export class WindowManager {
 
     this.settingsWindow.on('closed', () => {
       this.settingsWindow = null;
+      // If prompter is not active, closing the settings window should cleanly exit the application
+      if (!this.isPrompterActive) {
+        this.destroyAll();
+        app.quit();
+      }
     });
 
     return this.settingsWindow;
@@ -282,9 +287,14 @@ export class WindowManager {
   public stopPrompter(): void {
     this.isPrompterActive = false;
 
-    // Hide overlay
+    // Destroy overlay window so all ScreenCaptureKit screen recording and WebAudio sessions release immediately
     if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
-      this.overlayWindow.hide();
+      try {
+        this.overlayWindow.destroy();
+      } catch (err) {
+        console.warn('[WindowManager] Error destroying overlay window:', err);
+      }
+      this.overlayWindow = null;
     }
 
     // Restore app presence in Dock
@@ -294,6 +304,26 @@ export class WindowManager {
 
     // Show settings window
     this.showSettings();
+  }
+
+  public destroyAll(): void {
+    this.isPrompterActive = false;
+    if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
+      try {
+        this.overlayWindow.destroy();
+      } catch {
+        // Ignore
+      }
+      this.overlayWindow = null;
+    }
+    if (this.settingsWindow && !this.settingsWindow.isDestroyed()) {
+      try {
+        this.settingsWindow.destroy();
+      } catch {
+        // Ignore
+      }
+      this.settingsWindow = null;
+    }
   }
 
   public getOverlay(): BrowserWindow | null {

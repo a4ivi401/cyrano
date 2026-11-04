@@ -547,12 +547,16 @@ app.on('second-instance', () => {
   }
 });
 
+app.on('before-quit', () => {
+  windowManager.destroyAll();
+});
+
 app.on('will-quit', () => {
+  windowManager.destroyAll();
   shortcutManager.unregister();
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  windowManager.destroyAll();
+  app.quit();
 });

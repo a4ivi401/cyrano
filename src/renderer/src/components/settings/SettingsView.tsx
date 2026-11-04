@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Play,
   RotateCcw,
@@ -100,7 +100,28 @@ export const SettingsView: React.FC = () => {
     text: string;
   } | null>(null);
 
+  const activeTestStreamRef = useRef<MediaStream | null>(null);
+
   const t = TRANSLATIONS[settings.language || 'en'];
+
+  // Clean up any active media stream if window unloads or component unmounts
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (activeTestStreamRef.current) {
+        activeTestStreamRef.current.getTracks().forEach((t) => {
+          try {
+            t.stop();
+          } catch {}
+        });
+        activeTestStreamRef.current = null;
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      handleBeforeUnload();
+    };
+  }, []);
 
   // Load initial settings, fonts, displays, whisper models & context stats
   useEffect(() => {
@@ -456,6 +477,7 @@ export const SettingsView: React.FC = () => {
         },
         video: false
       });
+      activeTestStreamRef.current = stream;
 
       audioCtx = new AudioContext();
       if (audioCtx.state === 'suspended') {
@@ -516,6 +538,7 @@ export const SettingsView: React.FC = () => {
       if (stream) {
         stream.getTracks().forEach((tr) => tr.stop());
       }
+      activeTestStreamRef.current = null;
       if (audioCtx && audioCtx.state !== 'closed') {
         void audioCtx.close();
       }
@@ -543,6 +566,7 @@ export const SettingsView: React.FC = () => {
           noiseSuppression: false
         }
       });
+      activeTestStreamRef.current = stream;
 
       const audioTracks = stream.getAudioTracks();
       if (audioTracks.length === 0) {
@@ -612,6 +636,7 @@ export const SettingsView: React.FC = () => {
       if (stream) {
         stream.getTracks().forEach((tr) => tr.stop());
       }
+      activeTestStreamRef.current = null;
       if (audioCtx && audioCtx.state !== 'closed') {
         void audioCtx.close();
       }
