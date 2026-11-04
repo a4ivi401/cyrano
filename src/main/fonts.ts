@@ -6,18 +6,30 @@ export function getAvailableFonts(): { label: string; value: string }[] {
   const fonts = [...COMMON_SYSTEM_FONTS];
   const detected = new Set<string>();
 
-  // Check common macOS font directories for additional typography
-  const fontDirs = ['/System/Library/Fonts', '/Library/Fonts'];
+  // Check common macOS, Windows & Linux font directories for additional typography
+  const fontDirs =
+    process.platform === 'win32'
+      ? [process.env.WINDIR ? path.join(process.env.WINDIR, 'Fonts') : 'C:\\Windows\\Fonts']
+      : process.platform === 'linux'
+        ? [
+            '/usr/share/fonts',
+            '/usr/local/share/fonts',
+            path.join(process.env.HOME || '', '.local/share/fonts')
+          ]
+        : ['/System/Library/Fonts', '/Library/Fonts'];
 
-  for (const dir of fontDirs) {
+  const scanDir = (dir: string, depth = 0) => {
+    if (depth > 2) return;
     try {
-      if (fs.existsSync(dir)) {
-        const files = fs.readdirSync(dir);
-        for (const file of files) {
-          const ext = path.extname(file).toLowerCase();
+      if (!fs.existsSync(dir)) return;
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          scanDir(path.join(dir, entry.name), depth + 1);
+        } else if (entry.isFile()) {
+          const ext = path.extname(entry.name).toLowerCase();
           if (['.ttf', '.otf', '.ttc'].includes(ext)) {
-            const name = path.basename(file, ext);
-            // Clean up font names (e.g. SFCompactText-Regular -> SF Compact Text)
+            const name = path.basename(entry.name, ext);
             const cleanName = name
               .replace(/[-_]/g, ' ')
               .replace(/\b(Regular|Bold|Italic|Medium|Light|Thin|Black|Heavy)\b/gi, '')
@@ -31,6 +43,10 @@ export function getAvailableFonts(): { label: string; value: string }[] {
     } catch {
       // Ignore directory access errors
     }
+  };
+
+  for (const dir of fontDirs) {
+    scanDir(dir, 0);
   }
 
   // Add detected unique fonts

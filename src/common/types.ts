@@ -8,9 +8,72 @@ export type PresetPosition =
 
 export type Language = 'en' | 'ru' | 'uk';
 
+export type AppMode = 'prompter' | 'copilot';
+
+export type LLMProvider = 'anthropic' | 'openai-compatible';
+
+export type CopilotTriggerMode = 'both' | 'hotkey' | 'auto';
+
+export type STTProvider = 'local-whisper' | 'cloud-whisper';
+
+export type LocalWhisperModelId =
+  | 'onnx-community/whisper-tiny'
+  | 'onnx-community/whisper-base'
+  | 'onnx-community/whisper-small'
+  | 'onnx-community/whisper-large-v3-turbo';
+
+export type STTLanguage = 'auto' | 'ru' | 'en' | 'uk';
+
+export type AudioSourceType = 'system' | 'mic';
+
+export interface TranscriptEntry {
+  id: string;
+  source: AudioSourceType;
+  text: string;
+  timestamp: number;
+}
+
+export interface WhisperModelInfo {
+  id: LocalWhisperModelId;
+  name: string;
+  sizeLabel: string;
+  description: string;
+  downloaded: boolean;
+}
+
+export interface WhisperDownloadProgress {
+  modelId: LocalWhisperModelId;
+  status: 'downloading' | 'ready' | 'error';
+  progress: number;
+  file?: string;
+  error?: string;
+}
+
+export interface ContextFolderStats {
+  folderPath: string;
+  fileCount: number;
+  totalChars: number;
+  topFiles: string[];
+  indexedAt: number;
+}
+
+export interface CopilotAnswerEvent {
+  requestId: string;
+  status: 'idle' | 'thinking' | 'streaming' | 'done' | 'error';
+  question?: string;
+  delta?: string;
+  fullText?: string;
+  error?: string;
+}
+
 export interface PrompterSettings {
   // Localization
   language: Language;
+
+  // Operating Mode
+  appMode: AppMode;
+  copilotCompact: boolean;
+  copilotOpacity: number; // 0.0 to 1.0
 
   // Script content
   text: string;
@@ -43,6 +106,31 @@ export interface PrompterSettings {
   hotkeyRewind: string;
   hotkeySpeedUp: string;
   hotkeySpeedDown: string;
+  hotkeyAskAI: string;
+
+  // LLM Configuration (Claude / OpenAI / Omnirouter / Custom URL)
+  llmProvider: LLMProvider;
+  llmApiKey: string;
+  llmBaseUrl: string;
+  llmModel: string;
+  llmSystemPrompt: string;
+  copilotTriggerMode: CopilotTriggerMode;
+
+  // Audio & Speech-to-Text (STT)
+  sttProvider: STTProvider;
+  localWhisperModel: LocalWhisperModelId;
+  cloudSttBaseUrl: string;
+  cloudSttApiKey: string;
+  cloudSttModel: string;
+  sttLanguage: STTLanguage;
+  captureSystemAudio: boolean;
+  captureMicAudio: boolean;
+  micDeviceId: string;
+  systemAudioDeviceId: string;
+
+  // Project / Folder Context
+  contextFolderPath: string;
+  contextCustomNotes: string;
 }
 
 export interface DisplayInfo {

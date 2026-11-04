@@ -6,6 +6,7 @@ export interface ShortcutHandlers {
   onTogglePlay: () => void;
   onRewind: () => void;
   onSpeedAdjust: (delta: number) => void;
+  onAskAI?: () => void;
 }
 
 export class ShortcutManager {
@@ -16,13 +17,21 @@ export class ShortcutManager {
 
     const registerKey = (key: string, name: string, callback: () => void) => {
       if (!key) return;
+      const isNonMac = process.platform !== 'darwin';
+      // On Windows & Linux, Command/Super is reserved by the OS (Xbox Game Bar / GNOME / KDE),
+      // so we map Control+Alt+Command+* to Control+Alt+Shift+*.
+      const normalizedKey =
+        isNonMac && key.includes('Command')
+          ? key.replace(/Command/g, 'Shift').replace(/Cmd/g, 'Shift')
+          : key;
+
       try {
-        const ok = globalShortcut.register(key, callback);
+        const ok = globalShortcut.register(normalizedKey, callback);
         if (!ok) {
-          console.warn(`[ShortcutManager] Failed to register ${name}: ${key}`);
+          console.warn(`[ShortcutManager] Failed to register ${name}: ${normalizedKey}`);
         }
       } catch (err) {
-        console.error(`[ShortcutManager] Error registering ${name} (${key}):`, err);
+        console.error(`[ShortcutManager] Error registering ${name} (${normalizedKey}):`, err);
       }
     };
 
@@ -40,6 +49,11 @@ export class ShortcutManager {
 
     // Speed Down (-10 px/s)
     registerKey(settings.hotkeySpeedDown, 'Speed Down', () => handlers.onSpeedAdjust(-10));
+
+    // Ask AI Copilot
+    if (handlers.onAskAI && settings.hotkeyAskAI) {
+      registerKey(settings.hotkeyAskAI, 'Ask AI Copilot', handlers.onAskAI);
+    }
 
     this.registered = true;
   }

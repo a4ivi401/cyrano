@@ -29,21 +29,32 @@ export class WindowManager {
       return this.settingsWindow;
     }
 
+    const isMac = process.platform === 'darwin';
+
     this.settingsWindow = new BrowserWindow({
-      width: 980,
+      width: 1020,
       height: 740,
-      minWidth: 840,
-      minHeight: 600,
-      title: 'Cyrano — Teleprompter Settings',
-      titleBarStyle: 'hiddenInset',
-      trafficLightPosition: { x: 16, y: 16 },
+      resizable: false,
+      maximizable: false,
+      fullscreenable: false,
+      title: 'Cyrano — Teleprompter & AI Copilot',
+      titleBarStyle: isMac ? 'hiddenInset' : 'default',
+      trafficLightPosition: isMac ? { x: 16, y: 16 } : undefined,
+      autoHideMenuBar: true,
+      icon: !isMac
+        ? path.join(
+            __dirname,
+            process.platform === 'win32' ? '../../build/icon.ico' : '../../build/icon.png'
+          )
+        : undefined,
       show: false,
       backgroundColor: '#0d1117',
       webPreferences: {
         preload: this.getPreloadPath(),
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: false
+        sandbox: false,
+        backgroundThrottling: false
       }
     });
 
@@ -82,6 +93,40 @@ export class WindowManager {
     const primaryDisplay = screen.getPrimaryDisplay();
     const { x: dispX, y: dispY, width: dispW, height: dispH } = primaryDisplay.workArea;
 
+    // Dedicated geometry for AI Copilot HUD Window (Cyrano floating overlay)
+    if (settings.appMode === 'copilot') {
+      const isCompact = Boolean(settings.copilotCompact);
+      const width = isCompact ? 580 : 740;
+      const height = isCompact ? 300 : 480;
+
+      let x = dispX + Math.round((dispW - width) / 2);
+      let y = dispY + 14;
+
+      switch (settings.presetPosition) {
+        case 'right-sidebar':
+          x = dispX + dispW - width - 20;
+          y = dispY + 20;
+          break;
+        case 'left-sidebar':
+          x = dispX + 20;
+          y = dispY + 20;
+          break;
+        case 'center':
+          x = dispX + Math.round((dispW - width) / 2);
+          y = dispY + Math.round((dispH - height) / 2);
+          break;
+        case 'top-center':
+        case 'top-full':
+        default:
+          x = dispX + Math.round((dispW - width) / 2);
+          y = dispY + 14;
+          break;
+      }
+
+      return { x, y, width, height };
+    }
+
+    // Classic Teleprompter Geometry
     let width = settings.width || 720;
     let height = settings.height || 260;
     let x = settings.xPosition;
@@ -137,14 +182,20 @@ export class WindowManager {
     return { x, y, width, height };
   }
 
-  // 3. Overlay Window Lifecycle
+  // 3. Overlay Window Lifecycle (Stealth, Non-Clickable Click-Through HUD)
   public createOrUpdateOverlay(settings: PrompterSettings): BrowserWindow {
     const bounds = this.calculateOverlayBounds(settings);
 
     if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
       this.overlayWindow.setBounds(bounds);
+      this.overlayWindow.setMovable(false);
+      this.overlayWindow.setFocusable(false);
+      // Cyrano stealth: completely click-through, mouse clicks pass directly to underlying apps
+      this.overlayWindow.setIgnoreMouseEvents(true, { forward: true });
       return this.overlayWindow;
     }
+
+    const isMac = process.platform === 'darwin';
 
     this.overlayWindow = new BrowserWindow({
       x: bounds.x,
@@ -157,26 +208,37 @@ export class WindowManager {
       hasShadow: false,
       resizable: false,
       movable: false,
-      focusable: false,      // Prevent stealing focus from target app
-      skipTaskbar: true,     // Exclude from taskbar
+      focusable: false,
+      skipTaskbar: true,     // Exclude from taskbar (Windows & Linux)
       show: false,
-      type: 'panel',         // NSPanel on macOS
+      type: isMac ? 'panel' : 'toolbar', // NSPanel on macOS, toolbar on Windows (hides from Alt+Tab)
       webPreferences: {
         preload: this.getPreloadPath(),
         contextIsolation: true,
         nodeIntegration: false,
-        sandbox: false
+        sandbox: false,
+        backgroundThrottling: false
       }
     });
 
-    // 1. OBS / Screen Share Invisibility: sets NSWindowSharingNone
+    // 1. OBS / Screen Share Invisibility:
+    // Sets NSWindowSharingNone on macOS and WDA_EXCLUDEFROMCAPTURE on Windows 10/11
     this.overlayWindow.setContentProtection(true);
 
-    // 2. High window level: stays above full-screen apps and keynote presentations
+    // 2. High window level: stays above full-screen apps and presentations
     this.overlayWindow.setAlwaysOnTop(true, 'screen-saver', 1);
-    this.overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+    if (isMac || process.platform === 'linux') {
+      try {
+        this.overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      } catch {
+        // Ignore if window manager does not support workspace pinning
+      }
+    }
 
-    // 3. Click-Through: all mouse clicks pass to the underlying window
+    // 3. Mouse interactivity:
+    // In both Teleprompter and AI Copilot modes, the window is click-through (Cyrano model).
+    // Mouse clicks pass through seamlessly to Zoom, IDE, browser, presentations.
+    // All control is driven by global hotkeys.
     this.overlayWindow.setIgnoreMouseEvents(true, { forward: true });
 
     this.overlayWindow.loadURL(this.getAppUrl('/overlay'));
