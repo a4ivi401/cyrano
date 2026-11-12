@@ -1,56 +1,72 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { PrompterSettings } from '../../../../common/types';
 import { DEFAULT_SETTINGS } from '../../../../common/constants';
 import { usePrompterScroll } from '../../hooks/usePrompterScroll';
+import { CopilotHud } from './CopilotHud';
+
+function hexToRgba(hex: string, alpha: number): string {
+  let cleanHex = hex.replace('#', '');
+  if (cleanHex.length === 3) {
+    cleanHex = cleanHex
+      .split('')
+      .map((character) => character + character)
+      .join('');
+  }
+  const value = parseInt(cleanHex, 16);
+  const red = (value >> 16) & 255;
+  const green = (value >> 8) & 255;
+  const blue = value & 255;
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+}
 
 export const OverlayView: React.FC = () => {
   const [settings, setSettings] = useState<PrompterSettings>(DEFAULT_SETTINGS);
   const containerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    // Initial fetch of settings
-    if (window.electronAPI) {
-      window.electronAPI.getSettings().then((s) => setSettings(s));
-      const unsub = window.electronAPI.onSettingsUpdated((newSettings) => {
-        setSettings(newSettings);
-      });
-      return () => unsub();
-    }
-  }, []);
+  const isCopilotMode = settings.appMode === 'copilot';
 
   const { progress, hudMessage } = usePrompterScroll({
     settings,
-    containerRef
+    containerRef,
+    enabled: !isCopilotMode
   });
 
-  // Convert hex color to rgba for background
-  const hexToRgba = (hex: string, alpha: number) => {
-    let cleanHex = hex.replace('#', '');
-    if (cleanHex.length === 3) {
-      cleanHex = cleanHex.split('').map((c) => c + c).join('');
-    }
-    const num = parseInt(cleanHex, 16);
-    const r = (num >> 16) & 255;
-    const g = (num >> 8) & 255;
-    const b = num & 255;
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-  };
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (!api) return;
+
+    let active = true;
+    void api.getSettings().then((nextSettings) => {
+      if (active) setSettings(nextSettings);
+    });
+    const unsubscribe = api.onSettingsUpdated((nextSettings) => {
+      setSettings(nextSettings);
+    });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
+
+  if (isCopilotMode) {
+    return <CopilotHud settings={settings} answerScrollRef={containerRef} />;
+  }
 
   const focalTop = settings.focalGuidePosition || 25;
 
   return (
     <div
       style={{
-        position: 'relative',
         width: '100vw',
         height: '100vh',
         backgroundColor: hexToRgba(settings.bgColor, settings.bgOpacity),
         overflow: 'hidden',
-        pointerEvents: 'none', // click-through
-        userSelect: 'none'
+        position: 'relative',
+        userSelect: 'none',
+        pointerEvents: 'none' // Click-through in teleprompter mode
       }}
     >
-      {/* Eye-line / Focal Guide */}
+      {/* Eye-line focal guide */}
       {settings.showFocalGuide && (
         <div
           style={{
@@ -59,102 +75,54 @@ export const OverlayView: React.FC = () => {
             left: 0,
             right: 0,
             height: '2px',
-            background: 'linear-gradient(90deg, transparent 0%, rgba(59, 130, 246, 0.4) 15%, rgba(59, 130, 246, 0.8) 50%, rgba(59, 130, 246, 0.4) 85%, transparent 100%)',
-            zIndex: 10,
-            pointerEvents: 'none'
+            backgroundColor: 'rgba(59, 130, 246, 0.4)',
+            boxShadow: '0 0 8px rgba(59, 130, 246, 0.6)',
+            zIndex: 10
           }}
-        >
-          {/* Subtle focal target notch on left */}
-          <div
-            style={{
-              position: 'absolute',
-              left: '12px',
-              top: '-4px',
-              width: '10px',
-              height: '10px',
-              borderRadius: '50%',
-              backgroundColor: '#3b82f6',
-              boxShadow: '0 0 6px #3b82f6'
-            }}
-          />
-        </div>
+        />
       )}
 
-      {/* Scrolling Text Container with Gradient Fade */}
-      <div
-        ref={containerRef}
-        className="no-scrollbar"
-        style={{
-          width: '100%',
-          height: '100%',
-          overflowY: 'scroll',
-          paddingLeft: '28px',
-          paddingRight: '28px',
-          paddingTop: `calc(${focalTop}vh - 1.2em)`,
-          paddingBottom: '80vh',
-          maskImage: 'linear-gradient(to bottom, transparent 0%, black 12%, black 88%, transparent 100%)',
-          WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, black 12%, black 88%, transparent 100%)',
-          transform: settings.flipHorizontal ? 'scaleX(-1)' : 'none'
-        }}
-      >
-        <div
-          style={{
-            fontFamily: settings.fontFamily,
-            fontSize: `${settings.fontSize}px`,
-            color: settings.textColor,
-            lineHeight: 1.6,
-            fontWeight: 500,
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-            textShadow: settings.textShadow
-              ? '0 2px 4px rgba(0, 0, 0, 0.95), 0 0 2px rgba(0, 0, 0, 1)'
-              : 'none'
-          }}
-        >
-          {settings.text}
-        </div>
-      </div>
-
-      {/* Floating Status HUD Pill */}
+      {/* Floating HUD status indicator for teleprompter */}
       {hudMessage && (
         <div
           style={{
             position: 'absolute',
-            top: '12px',
-            right: '16px',
-            backgroundColor: 'rgba(15, 23, 42, 0.85)',
-            border: '1px solid rgba(59, 130, 246, 0.4)',
-            color: '#f8fafc',
-            padding: '4px 10px',
-            borderRadius: '9999px',
+            top: '8px',
+            right: '12px',
+            backgroundColor: 'rgba(0, 0, 0, 0.75)',
+            color: '#60a5fa',
+            padding: '2px 8px',
+            borderRadius: '4px',
             fontSize: '11px',
             fontWeight: 600,
-            letterSpacing: '0.05em',
-            boxShadow: '0 4px 12px rgba(0,0,0,0.5)',
-            backdropFilter: 'blur(8px)',
-            zIndex: 30,
-            transition: 'opacity 0.2s ease',
-            pointerEvents: 'none'
+            zIndex: 20
           }}
         >
           {hudMessage}
         </div>
       )}
 
-      {/* Reading Progress Indicator Line */}
+      {/* Script scrolling container */}
       <div
+        ref={containerRef}
         style={{
-          position: 'absolute',
-          bottom: 0,
-          left: 0,
-          width: `${progress}%`,
-          height: '2px',
-          backgroundColor: '#3b82f6',
-          boxShadow: '0 0 4px #3b82f6',
-          zIndex: 20,
-          transition: 'width 0.1s linear'
+          width: '100%',
+          height: '100%',
+          overflowY: 'hidden',
+          padding: '20px 24px',
+          boxSizing: 'border-box',
+          fontFamily: settings.fontFamily,
+          fontSize: `${settings.fontSize}px`,
+          color: settings.textColor,
+          lineHeight: 1.45,
+          textShadow: settings.textShadow ? '0 2px 4px rgba(0,0,0,0.9)' : 'none',
+          whiteSpace: 'pre-wrap',
+          wordBreak: 'break-word',
+          transform: settings.flipHorizontal ? 'scaleX(-1)' : 'none'
         }}
-      />
+      >
+        {settings.text}
+      </div>
     </div>
   );
 };

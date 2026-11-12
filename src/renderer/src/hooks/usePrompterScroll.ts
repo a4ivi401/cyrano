@@ -5,9 +5,14 @@ import { TRANSLATIONS } from '../../../common/i18n';
 interface UsePrompterScrollProps {
   settings: PrompterSettings;
   containerRef: React.RefObject<HTMLDivElement>;
+  enabled?: boolean;
 }
 
-export function usePrompterScroll({ settings, containerRef }: UsePrompterScrollProps) {
+export function usePrompterScroll({
+  settings,
+  containerRef,
+  enabled = true
+}: UsePrompterScrollProps) {
   const [isPlaying, setIsPlaying] = useState<boolean>(true);
   const [speed, setSpeed] = useState<number>(settings.speed);
   const [progress, setProgress] = useState<number>(0);
@@ -29,12 +34,13 @@ export function usePrompterScroll({ settings, containerRef }: UsePrompterScrollP
   }, []);
 
   const togglePlay = useCallback(() => {
+    if (!enabled) return;
     setIsPlaying((prev) => {
       const next = !prev;
       showTemporaryHud(next ? t.hudPlaying : t.hudPaused);
       return next;
     });
-  }, [showTemporaryHud, t]);
+  }, [enabled, showTemporaryHud, t]);
 
   const rewind = useCallback(() => {
     scrollAccumulatorRef.current = 0;
@@ -42,18 +48,21 @@ export function usePrompterScroll({ settings, containerRef }: UsePrompterScrollP
       containerRef.current.scrollTop = 0;
     }
     setProgress(0);
-    showTemporaryHud(t.hudRewound);
-  }, [containerRef, showTemporaryHud, t]);
+    if (enabled) {
+      showTemporaryHud(t.hudRewound);
+    }
+  }, [containerRef, enabled, showTemporaryHud, t]);
 
   const adjustSpeed = useCallback(
     (delta: number) => {
+      if (!enabled) return;
       setSpeed((prev) => {
         const next = Math.max(10, Math.min(300, prev + delta));
         showTemporaryHud(`⚡ ${next} PX/S`);
         return next;
       });
     },
-    [showTemporaryHud]
+    [containerRef, enabled, showTemporaryHud]
   );
 
   // Sync speed if updated from settings
@@ -70,7 +79,9 @@ export function usePrompterScroll({ settings, containerRef }: UsePrompterScrollP
       window.electronAPI.onRewind(rewind),
       window.electronAPI.onAdjustSpeed((delta) => adjustSpeed(delta)),
       window.electronAPI.onStart(() => {
-        setIsPlaying(true);
+        if (enabled) {
+          setIsPlaying(true);
+        }
         rewind();
       })
     ];
@@ -78,10 +89,16 @@ export function usePrompterScroll({ settings, containerRef }: UsePrompterScrollP
     return () => {
       unsubs.forEach((unsub) => unsub());
     };
-  }, [togglePlay, rewind, adjustSpeed]);
+  }, [togglePlay, rewind, adjustSpeed, enabled]);
 
-  // Main animation frame loop
+  // Main animation frame loop (ONLY runs in Teleprompter mode when enabled === true)
   useEffect(() => {
+    if (!enabled) {
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+      lastTimeRef.current = null;
+      return;
+    }
+
     const loop = (timestamp: DOMHighResTimeStamp) => {
       if (lastTimeRef.current === null) {
         lastTimeRef.current = timestamp;
@@ -123,7 +140,7 @@ export function usePrompterScroll({ settings, containerRef }: UsePrompterScrollP
       if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
       lastTimeRef.current = null;
     };
-  }, [isPlaying, speed, settings.autoRewindOnEnd, containerRef, rewind, showTemporaryHud]);
+  }, [enabled, isPlaying, speed, settings.autoRewindOnEnd, containerRef, rewind, showTemporaryHud]);
 
   return {
     isPlaying,

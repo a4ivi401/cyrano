@@ -10,7 +10,12 @@ async function startDev() {
     bundle: true,
     platform: 'node',
     target: 'node20',
-    external: ['electron'],
+    external: [
+      'electron',
+      '@huggingface/transformers',
+      'onnxruntime-node',
+      'sharp'
+    ],
     outfile: path.join(__dirname, '../dist/main/index.js'),
     sourcemap: 'inline'
   });

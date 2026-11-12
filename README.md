@@ -1,34 +1,26 @@
-# Cyrano 🎭
+# Cyrano
 
-> **The Invisibility-First Teleprompter for macOS**  
-> Read your script directly from your screen with perfect eye contact—completely invisible to Zoom, Google Meet, Microsoft Teams, OBS Studio, QuickTime, and ScreenCaptureKit.
+> **A cross-platform AI Copilot for project defenses, with a built-in stealth teleprompter.**
+> Cyrano listens to meeting audio, transcribes questions with local or cloud Whisper, and answers with verified project file and line references.
 
 ---
 
 ## 🌟 Key Features
 
-- 🕵️ **100% Invisible to Screen Sharing & Recording**  
-  Uses native macOS `NSWindowSharingNone` window protection (`setContentProtection(true)`). Even while actively broadcasting your display or recording via OBS, the prompter is physically visible to you alone.
-- 🖱️ **Non-Clickable / Click-Through Overlay**  
-  Mouse events pass completely through the overlay (`setIgnoreMouseEvents(true, { forward: true })`). Click links, advance slides, scroll pages, and switch windows underneath with zero interruption.
-- 🫥 **Automatic Dock & App Switcher Vanishing**  
-  The moment the prompter launches, Cyrano hides itself from the macOS Dock and the `Cmd + Tab` app switcher (`app.dock.hide()`). Closing the overlay smoothly restores the app to the Dock (`app.dock.show()`).
-- ⌨️ **Conflict-Free Global Hotkeys**  
-  Control your prompter without ever bringing Cyrano into focus. Uses 4-modifier Hyper shortcuts (`Control + Option + Command`) by default to guarantee zero conflict with macOS system hotkeys.
-- 📐 **Flexible Placement Presets & Geometry**  
-  - **Top-Center (Camera Mount):** Placed directly under your MacBook or external webcam for natural eye contact.
-  - **Top Full Width:** A subtle banner at the top edge of your screen.
-  - **Screen Center / Left Column / Right Column / Custom:** Adjust width, height, and coordinates freely.
-- 🌐 **Multi-Language Support (i18n)**  
-  Instant switching between English (`EN`), Russian (`RU`), and Ukrainian (`UK`) with localized sample presentation scripts.
-- 🪟 **True Crystal Glass Transparency (0%–100%)**  
-  True transparent overlay mode allows 100% clear glass where only the crisp floating text and focal guide line appear over your desktop, preventing eye fatigue.
-- 📦 **One-Click macOS DMG Distribution**  
-  Automated build pipeline with `electron-builder` producing a standalone `.dmg` installer with `/Applications` drag-and-drop shortcut.
-- ⚡ **Delta-Time Jitter-Free Smooth Scrolling**  
-  Sub-pixel delta-time scrolling using `requestAnimationFrame`, ensuring identical, buttery-smooth scrolling across 60Hz and 120Hz ProMotion displays.
-- 👁️ **Eye-Line Focal Guide & Mirror Mode**  
-  Features an adjustable horizontal eye-contact line and optional horizontal flip for physical beam-splitter teleprompter glass.
+- **AI Copilot readiness check** for the answer model, meeting audio, STT, and project context.
+- **Local Whisper by default**, with explicit optional cloud STT and atomic model downloads.
+- **Hybrid question flow** with automatic detection, a cancellation window, manual confirmation, and editable transcripts.
+- **Verified code references** derived only from indexed source chunks, formatted as `Filename.ext(start-end)`.
+- **Source-aware audio**: system loopback is the interlocutor; the microphone is never used as a hidden fallback.
+- **Windows, macOS, and Linux packaging**, including audited Windows Sharp and ONNX native modules.
+- **Classic teleprompter mode** with the existing scrolling, focal guide, mirror, positioning, and hotkeys.
+
+- **Protected overlay** using Electron content protection where supported; screen-share exclusion must be smoke-tested on each target platform.
+- **Click-through behavior** outside interactive Copilot controls.
+- **Global hotkeys** with platform-specific normalization for macOS, Windows, and Linux.
+- **Flexible placement and opacity**, including focal-guide and mirror options for the Teleprompter.
+- **English, Russian, and Ukrainian localization**.
+- **Offline UI styling** bundled into the application rather than loaded from a CDN.
 
 ---
 
@@ -92,9 +84,9 @@ Keeps your desktop presentation clean and prevents attendees or viewers from not
 ## 🚀 Installation & Getting Started
 
 ### Prerequisites
-- macOS 12.0 (Monterey) or later
-- Node.js 18+ (Node 20+ recommended)
-- `npm` or `pnpm`
+- Windows 10/11, macOS 12+, or a supported Linux desktop
+- Node.js 20+
+- `pnpm`
 
 ### Setup
 
@@ -103,40 +95,43 @@ Keeps your desktop presentation clean and prevents attendees or viewers from not
 cd cyrano
 
 # 2. Install dependencies
-npm install
+pnpm install
 
 # 3. Start development mode
-npm run dev
+pnpm dev
 ```
 
 ### Production Build & Packaging
 
 ```bash
-# Compile renderer (Vite), main process (esbuild), and preload script
-npm run build
+# Unit tests, typecheck, and production build
+pnpm test
+pnpm typecheck
+pnpm build
 
 # Launch compiled application locally
-npm start
+pnpm start
 
-# Package standalone macOS .app bundle
-npm run package
+# Prepare bundled Tiny/Base Whisper resources when required
+pnpm download:model
 
-# Build distributable macOS .dmg installer (in release/ folder)
-npm run build:dmg
-# or: npm run dist:mac
+# Platform packages
+pnpm dist:mac
+pnpm dist:win
+pnpm dist:linux
 ```
-
-The resulting disk image is generated at `release/Cyrano-1.0.0-arm64.dmg` ready for drag-and-drop installation to `/Applications`.
 
 ---
 
 ## 🛠️ Tech Stack
 
-- **Runtime:** [Electron 33](https://www.electronjs.org/)
+- **Runtime:** [Electron 45](https://www.electronjs.org/)
 - **UI Framework:** [React 18](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/)
 - **Bundler:** [Vite 5](https://vitejs.dev/) (Renderer) + [esbuild](https://esbuild.github.io/) (Main / Preload)
 - **Icons:** [lucide-react](https://lucide.dev/)
-- **Architecture:** Multi-window hash routing (`/#/settings` for Settings, `/#/overlay` for Prompter)
+- **STT:** Hugging Face Transformers + ONNX Runtime, or a compatible cloud transcription API
+- **LLM:** Anthropic Messages API and OpenAI-compatible endpoints
+- **Architecture:** Electron main-process session orchestration with Settings and protected Overlay renderers
 
 ---
 
