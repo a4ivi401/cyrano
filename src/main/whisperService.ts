@@ -1,13 +1,10 @@
-import { app } from 'electron';
-import * as fs from 'fs';
-import * as path from 'path';
 import {
   LocalWhisperModelId,
   PrompterSettings,
   WhisperDownloadProgress,
   WhisperModelInfo
 } from '../common/types';
-import { WHISPER_MODEL_CATALOG } from '../common/constants';
+import { WhisperModelManager } from './whisperModelManager';
 
 // Known Whisper silence/background-noise hallucinations in RU/EN/UK
 const HALLUCINATION_PATTERNS = [
@@ -29,40 +26,47 @@ const HALLUCINATION_PATTERNS = [
   /^(\.|\s)+$/
 ];
 
-export class WhisperService {
-  private cacheDir: string;
-  private activeModelId: string | null = null;
-  private transcriber: any = null;
-  private loadingPromise: Promise<any> | null = null;
-  private isTranscribing: boolean = false;
+interface DisposableValue {
+  dispose: () => unknown;
+}
 
-  constructor() {
-    this.cacheDir = path.join(app.getPath('userData'), 'whisper-models');
-    if (!fs.existsSync(this.cacheDir)) {
-      fs.mkdirSync(this.cacheDir, { recursive: true });
-    }
+function isDisposableValue(value: unknown): value is DisposableValue {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'dispose' in value &&
+    typeof value.dispose === 'function'
+  );
+}
+
+export class WhisperService {
+  private readonly modelManager: WhisperModelManager;
+  private activeModelId: LocalWhisperModelId | null = null;
+  private transcriber: any = null;
+  private tensorConstructor: any = null;
+  private readonly loadingModels = new Map<LocalWhisperModelId, Promise<any>>();
+  private modelLoadQueue: Promise<void> = Promise.resolve();
+  private inferenceQueue: Promise<void> = Promise.resolve();
+
+  constructor(modelManager = new WhisperModelManager()) {
+    this.modelManager = modelManager;
   }
 
   public getModelsStatus(): WhisperModelInfo[] {
-    return WHISPER_MODEL_CATALOG.map((item) => ({
-      ...item,
-      downloaded: this.isModelDownloaded(item.id)
+    return this.modelManager.getModelsStatus().map((model) => ({
+      ...model,
+      selected: model.id === this.activeModelId
     }));
   }
 
   public isModelDownloaded(modelId: LocalWhisperModelId): boolean {
-    const modelDir = path.join(this.cacheDir, ...modelId.split('/'));
-    const onnxDir = path.join(modelDir, 'onnx');
-    const configPath = path.join(modelDir, 'config.json');
-    if (!fs.existsSync(configPath) || !fs.existsSync(onnxDir)) {
-      return false;
-    }
-    try {
-      const files = fs.readdirSync(onnxDir);
-      return files.some((f) => f.endsWith('.onnx'));
-    } catch {
-      return false;
-    }
+    return this.modelManager
+      .getModelsStatus()
+      .some((model) => model.id === modelId && model.downloaded);
+  }
+
+  public cancelModelDownload(modelId: LocalWhisperModelId): boolean {
+    return this.modelManager.cancelModelDownload(modelId);
   }
 
   public async downloadOrLoadModel(
@@ -78,84 +82,88 @@ export class WhisperService {
       return this.transcriber;
     }
 
-    if (this.loadingPromise && this.activeModelId === modelId) {
-      return this.loadingPromise;
-    }
+    const existingLoad = this.loadingModels.get(modelId);
+    if (existingLoad) return existingLoad;
 
-    this.activeModelId = modelId;
-
-    this.loadingPromise = (async () => {
-      try {
-        let transformers: any;
-        try {
-          transformers = await import('@huggingface/transformers');
-        } catch {
-          transformers = typeof require !== 'undefined' ? require('@huggingface/transformers') : {};
+    const loading = this.modelManager
+      .ensureModel(modelId, (progress) => {
+        if (progress.status === 'ready') {
+          onProgress?.({ modelId, status: 'validating', progress: 98 });
+        } else {
+          onProgress?.(progress);
         }
-        const env = transformers.env || transformers.default?.env;
-        const pipeline = transformers.pipeline || transformers.default?.pipeline;
+      })
+      .then((modelPath) =>
+        this.enqueueModelLoad(async () => {
+          if (this.transcriber && this.activeModelId === modelId) return this.transcriber;
 
-        if (env) {
-          env.cacheDir = this.cacheDir;
-          env.allowLocalModels = true;
-          env.allowRemoteModels = true;
-        }
-
-        if (typeof pipeline !== 'function') {
-          throw new Error('Pipeline function is not available in @huggingface/transformers');
-        }
-
-        onProgress?.({
-          modelId,
-          status: 'downloading',
-          progress: 1
-        });
-
-        const pipe = await pipeline('automatic-speech-recognition', modelId, {
-          dtype: 'q8',
-          progress_callback: (info: any) => {
-            if (!onProgress || !info) return;
-            if (info.status === 'progress' && typeof info.progress === 'number') {
-              onProgress({
-                modelId,
-                status: 'downloading',
-                progress: Math.min(99, Math.max(1, Math.round(info.progress))),
-                file: info.file
-              });
-            } else if (info.status === 'ready') {
-              onProgress({
-                modelId,
-                status: 'ready',
-                progress: 100
-              });
-            }
+          let transformers: any;
+          try {
+            transformers = await import('@huggingface/transformers');
+          } catch (error) {
+            throw new Error(
+              `Local Whisper runtime could not be loaded: ${this.errorMessage(error)}`
+            );
           }
-        });
 
-        this.transcriber = pipe;
-        onProgress?.({
-          modelId,
-          status: 'ready',
-          progress: 100
-        });
-        return pipe;
-      } catch (err: any) {
-        this.transcriber = null;
-        this.activeModelId = null;
-        const msg = err?.message || 'Failed to load Whisper model';
+          const env = transformers.env || transformers.default?.env;
+          const pipeline = transformers.pipeline || transformers.default?.pipeline;
+          const Tensor = transformers.Tensor || transformers.default?.Tensor;
+          if (!env || typeof pipeline !== 'function' || typeof Tensor !== 'function') {
+            throw new Error('The installed @huggingface/transformers runtime is incomplete');
+          }
+
+          env.allowLocalModels = true;
+          env.allowRemoteModels = false;
+
+          onProgress?.({ modelId, status: 'validating', progress: 99 });
+          const pipe = await pipeline('automatic-speech-recognition', modelPath, {
+            dtype: 'q8',
+            local_files_only: true
+          });
+
+          const previousPipeline =
+            this.transcriber && this.activeModelId !== modelId ? this.transcriber : null;
+          this.transcriber = pipe;
+          this.tensorConstructor = Tensor;
+          this.activeModelId = modelId;
+          if (previousPipeline) {
+            void this.inferenceQueue.then(() => this.disposePipeline(previousPipeline));
+          }
+          onProgress?.({ modelId, status: 'ready', progress: 100 });
+          return pipe;
+        })
+      )
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.name === 'ModelDownloadCancelledError') {
+          throw error;
+        }
+        const message = this.localRuntimeError(modelId, error);
         onProgress?.({
           modelId,
           status: 'error',
           progress: 0,
-          error: msg
+          error: message
         });
-        throw err;
-      } finally {
-        this.loadingPromise = null;
-      }
-    })();
+        throw new Error(message);
+      })
+      .finally(() => {
+        if (this.loadingModels.get(modelId) === loading) {
+          this.loadingModels.delete(modelId);
+        }
+      });
 
-    return this.loadingPromise;
+    this.loadingModels.set(modelId, loading);
+    return loading;
+  }
+
+  private enqueueModelLoad<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.modelLoadQueue.then(operation);
+    this.modelLoadQueue = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
   }
 
   public async transcribe(
@@ -163,17 +171,10 @@ export class WhisperService {
     settings: PrompterSettings,
     onProgress?: (progress: WhisperDownloadProgress) => void
   ): Promise<string> {
-    let rawSamples: Float32Array;
-    if (samplesInput instanceof Float32Array) {
-      rawSamples = samplesInput;
-    } else if (Array.isArray(samplesInput) || ArrayBuffer.isView(samplesInput)) {
-      rawSamples = Float32Array.from(samplesInput as ArrayLike<number>);
-    } else if (samplesInput && typeof samplesInput === 'object') {
-      const vals = Object.values(samplesInput as unknown as Record<string, number>);
-      rawSamples = Float32Array.from(vals);
-    } else {
-      return '';
-    }
+    const rawSamples =
+      samplesInput instanceof Float32Array
+        ? samplesInput
+        : Float32Array.from(samplesInput);
 
     // Minimum ~0.35s of audio at 16kHz
     if (rawSamples.length < 5600) {
@@ -217,46 +218,137 @@ export class WhisperService {
     settings: PrompterSettings,
     onProgress?: (progress: WhisperDownloadProgress) => void
   ): Promise<string> {
-    // Drop outdated audio chunks if queue is backed up, preventing seconds of lag
-    let waitCount = 0;
-    while (this.isTranscribing) {
-      await new Promise((r) => setTimeout(r, 60));
-      waitCount++;
-      if (waitCount > 25) {
+    return this.enqueueInference(async () => {
+      try {
+        const pipe = await this.downloadOrLoadModel(settings.localWhisperModel, onProgress);
+        const languageMap: Record<string, string> = {
+          ru: 'russian',
+          en: 'english',
+          uk: 'ukrainian'
+        };
+        const language =
+          settings.sttLanguage && settings.sttLanguage !== 'auto'
+            ? languageMap[settings.sttLanguage]
+            : await this.detectWhisperLanguage(pipe, samples);
+
+        const generateOptions: any = {
+          language,
+          task: 'transcribe',
+          return_timestamps: false,
+          max_new_tokens: 128
+        };
+        if (samples.length > 16000 * 25) {
+          generateOptions.chunk_length_s = 25;
+          generateOptions.stride_length_s = 4;
+        }
+
+        const result = await pipe(samples, generateOptions);
+        if (typeof result === 'string') return result;
+        if (result && typeof result.text === 'string') return result.text;
         return '';
+      } catch (error) {
+        throw new Error(`Local Whisper transcription failed: ${this.errorMessage(error)}`);
       }
+    });
+  }
+
+  private enqueueInference<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.inferenceQueue.then(operation);
+    this.inferenceQueue = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
+
+  private async detectWhisperLanguage(pipe: any, samples: Float32Array): Promise<string> {
+    const model = pipe?.model;
+    const processor = pipe?.processor;
+    const generationConfig = model?.generation_config;
+    const languageIds = generationConfig?.lang_to_id;
+    const decoderStartTokenId = generationConfig?.decoder_start_token_id;
+    if (
+      typeof processor !== 'function' ||
+      typeof model !== 'function' ||
+      !languageIds ||
+      !Number.isInteger(decoderStartTokenId) ||
+      typeof this.tensorConstructor !== 'function'
+    ) {
+      throw new Error('This Whisper runtime does not expose multilingual language detection');
     }
 
-    this.isTranscribing = true;
+    let processed: any;
+    let decoderInput: any;
+    let output: any;
     try {
-      const pipe = await this.downloadOrLoadModel(settings.localWhisperModel, onProgress);
-      // Determine language: if auto/unset, match the app language (RU/UK/EN).
-      // Crucial: @huggingface/transformers forces English (en) when language is undefined!
-      const appLang = settings.language || 'ru';
-      const langKey =
-        settings.sttLanguage && settings.sttLanguage !== 'auto'
-          ? settings.sttLanguage
-          : appLang;
-
-      const langMap: Record<string, string> = {
-        ru: 'russian',
-        en: 'english',
-        uk: 'ukrainian'
-      };
-      const language = langMap[langKey] || 'russian';
-
-      const result = await pipe(samples, {
-        language,
-        task: 'transcribe',
-        chunk_length_s: 25,
-        stride_length_s: 4
+      processed = await processor(samples);
+      decoderInput = new this.tensorConstructor(
+        'int64',
+        new BigInt64Array([BigInt(decoderStartTokenId)]),
+        [1, 1]
+      );
+      output = await model({
+        input_features: processed.input_features,
+        decoder_input_ids: decoderInput
       });
 
-      if (typeof result === 'string') return result;
-      if (result && typeof result.text === 'string') return result.text;
-      return '';
+      const logits = output?.logits;
+      const vocabularySize = logits?.dims?.at(-1);
+      if (!logits?.data || !Number.isInteger(vocabularySize) || vocabularySize <= 0) {
+        throw new Error('Whisper language detection did not return decoder logits');
+      }
+
+      const offset = logits.data.length - vocabularySize;
+      let bestToken = '';
+      let bestScore = Number.NEGATIVE_INFINITY;
+      const supportedLanguageTokens = new Set(['<|ru|>', '<|en|>', '<|uk|>']);
+      for (const [token, rawTokenId] of Object.entries(languageIds)) {
+        const tokenId = Number(rawTokenId);
+        if (!supportedLanguageTokens.has(token) || tokenId < 0 || tokenId >= vocabularySize) {
+          continue;
+        }
+        const score = Number(logits.data[offset + tokenId]);
+        if (score > bestScore) {
+          bestScore = score;
+          bestToken = token;
+        }
+      }
+
+      const match = /^<\|([a-z]{2,3})\|>$/.exec(bestToken);
+      if (!match) throw new Error('Whisper could not determine the spoken language');
+      return match[1];
     } finally {
-      this.isTranscribing = false;
+      await this.disposeTensorValues(output, processed, decoderInput);
+    }
+  }
+
+  private async disposeTensorValues(...containers: unknown[]): Promise<void> {
+    const disposed = new Set<DisposableValue>();
+    for (const container of containers) {
+      const values = [
+        container,
+        ...(container && typeof container === 'object'
+          ? Object.values(container as Record<string, unknown>)
+          : [])
+      ];
+      for (const value of values) {
+        if (!isDisposableValue(value) || disposed.has(value)) continue;
+        disposed.add(value);
+        await Promise.resolve(value.dispose()).catch(() => {});
+      }
+    }
+  }
+
+  private async disposePipeline(pipeline: unknown): Promise<void> {
+    if (isDisposableValue(pipeline)) {
+      await Promise.resolve(pipeline.dispose()).catch(() => {});
+      return;
+    }
+    if (pipeline && typeof pipeline === 'object') {
+      const model = (pipeline as Record<string, unknown>).model;
+      if (isDisposableValue(model)) {
+        await Promise.resolve(model.dispose()).catch(() => {});
+      }
     }
   }
 
@@ -277,27 +369,54 @@ export class WhisperService {
     const formData = new FormData();
     formData.append('file', blob, 'speech.wav');
     formData.append('model', model);
-    const cloudLang =
-      settings.sttLanguage && settings.sttLanguage !== 'auto'
-        ? settings.sttLanguage
-        : (settings.language || 'ru');
-    formData.append('language', cloudLang);
+    if (settings.sttLanguage && settings.sttLanguage !== 'auto') {
+      formData.append('language', settings.sttLanguage);
+    }
 
-    const response = await fetch(`${baseUrl}/audio/transcriptions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: formData
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${baseUrl}/audio/transcriptions`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: formData
+      });
+    } catch (error) {
+      throw new Error(`Cloud STT request failed: ${this.errorMessage(error)}`);
+    }
 
     if (!response.ok) {
       const errBody = await response.text().catch(() => '');
       throw new Error(`Cloud STT HTTP ${response.status}: ${errBody.slice(0, 200)}`);
     }
 
-    const data = (await response.json()) as { text?: string };
-    return data.text || '';
+    let data: { text?: string };
+    try {
+      data = (await response.json()) as { text?: string };
+    } catch {
+      throw new Error('Cloud STT returned an invalid JSON response');
+    }
+    return typeof data.text === 'string' ? data.text : '';
+  }
+
+  private localRuntimeError(modelId: LocalWhisperModelId, error: unknown): string {
+    const message = this.errorMessage(error);
+    if (/@img\/sharp-win32|sharp.*(module|binary)|Could not load the "sharp" module/i.test(message)) {
+      return `Local Whisper cannot start because the Windows Sharp native package is missing or incompatible (${message})`;
+    }
+    if (/onnxruntime_binding|onnxruntime\.dll|DLL initialization|dynamic library.*onnx/i.test(message)) {
+      return `Local Whisper cannot start because ONNX Runtime is missing or incompatible (${message})`;
+    }
+    if (/local_files_only|file was not found locally|ModelFileNotFound/i.test(message)) {
+      return `Verified Whisper model ${modelId} is missing a runtime-required local file (${message})`;
+    }
+    return `Failed to load local Whisper model ${modelId}: ${message}`;
+  }
+
+  private errorMessage(error: unknown): string {
+    if (error instanceof Error && error.message) return error.message;
+    return String(error || 'Unknown error');
   }
 
   private encodeWav16kHzMono(samples: Float32Array): Buffer {

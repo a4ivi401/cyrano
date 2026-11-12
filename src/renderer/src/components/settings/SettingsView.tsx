@@ -20,6 +20,12 @@ import {
   Sparkles,
   Volume2,
   AlertCircle,
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  LoaderCircle,
+  X,
+  XCircle,
   ExternalLink,
   Laptop
 } from 'lucide-react';
@@ -30,21 +36,24 @@ import {
   DisplayInfo,
   Language,
   LLMProvider,
-  STTProvider,
   LocalWhisperModelId,
   CopilotTriggerMode,
   STTLanguage,
   WhisperModelInfo,
   WhisperDownloadProgress,
-  ContextFolderStats
+  ContextFolderStats,
+  CopilotReadiness,
+  CopilotReadinessItemId,
+  CopilotReadinessStatus
 } from '../../../../common/types';
 import {
   DEFAULT_SETTINGS,
   LLM_ENDPOINT_PRESETS,
   WHISPER_MODEL_CATALOG
 } from '../../../../common/constants';
-import { TRANSLATIONS } from '../../../../common/i18n';
+import { TRANSLATIONS, Translations } from '../../../../common/i18n';
 import { PermissionStatus, PermissionState } from '../../../../common/electronApi';
+import { decodePcm16Le } from '../../audio/pcm';
 
 interface FontOption {
   label: string;
@@ -56,20 +65,95 @@ interface AudioDeviceOption {
   label: string;
 }
 
+type SettingsTab =
+  | 'script'
+  | 'copilot'
+  | 'audio-context'
+  | 'appearance'
+  | 'position'
+  | 'hotkeys';
+
+const LLM_CONFIG_KEYS = new Set<keyof PrompterSettings>([
+  'llmProvider',
+  'llmBaseUrl',
+  'llmApiKey',
+  'llmModel'
+]);
+
+const READINESS_SETTING_KEYS = new Set<keyof PrompterSettings>([
+  ...LLM_CONFIG_KEYS,
+  'captureSystemAudio',
+  'captureMicAudio',
+  'micDeviceId',
+  'sttProvider',
+  'localWhisperModel',
+  'cloudSttBaseUrl',
+  'cloudSttApiKey',
+  'cloudSttModel',
+  'copilotTriggerMode',
+  'contextFolderPath'
+]);
+
+const getErrorMessage = (error: unknown, fallback: string): string =>
+  error instanceof Error && error.message ? error.message : fallback;
+
+const getLlmConfigSignature = (value: PrompterSettings): string =>
+  [value.llmProvider, value.llmBaseUrl.trim(), value.llmApiKey, value.llmModel.trim()].join('\u0000');
+
+const isWhisperModelReady = (model: WhisperModelInfo | undefined): boolean =>
+  Boolean(model?.downloaded && (model.status === undefined || model.status === 'ready'));
+
+const getWhisperName = (
+  modelId: LocalWhisperModelId,
+  translations: Translations
+): string => {
+  switch (modelId) {
+    case 'onnx-community/whisper-tiny':
+      return translations.whisperTinyName;
+    case 'onnx-community/whisper-base':
+      return translations.whisperBaseName;
+    case 'onnx-community/whisper-small':
+      return translations.whisperSmallName;
+    case 'onnx-community/whisper-large-v3-turbo':
+      return translations.whisperTurboName;
+  }
+};
+
+const getWhisperDescription = (
+  modelId: LocalWhisperModelId,
+  translations: Translations
+): string => {
+  switch (modelId) {
+    case 'onnx-community/whisper-tiny':
+      return translations.whisperTinyDesc;
+    case 'onnx-community/whisper-base':
+      return translations.whisperBaseDesc;
+    case 'onnx-community/whisper-small':
+      return translations.whisperSmallDesc;
+    case 'onnx-community/whisper-large-v3-turbo':
+      return translations.whisperTurboDesc;
+  }
+};
+
 export const SettingsView: React.FC = () => {
   const [settings, setSettings] = useState<PrompterSettings>(DEFAULT_SETTINGS);
   const [fonts, setFonts] = useState<FontOption[]>([]);
   const [displays, setDisplays] = useState<DisplayInfo[]>([]);
-  const [activeTab, setActiveTab] = useState<
-    'script' | 'copilot' | 'audio-context' | 'appearance' | 'position' | 'hotkeys'
-  >('script');
+  const [activeTab, setActiveTab] = useState<SettingsTab>(
+    DEFAULT_SETTINGS.appMode === 'copilot' ? 'copilot' : 'script'
+  );
   const [isSaved, setIsSaved] = useState<boolean>(false);
   const [isLaunching, setIsLaunching] = useState<boolean>(false);
+  const [readiness, setReadiness] = useState<CopilotReadiness | null>(null);
+  const [isRefreshingReadiness, setIsRefreshingReadiness] = useState<boolean>(false);
+  const [readinessError, setReadinessError] = useState<boolean>(false);
+  const [launchBlockers, setLaunchBlockers] = useState<string[]>([]);
 
   // Copilot & Audio UI state
   const [whisperModels, setWhisperModels] = useState<WhisperModelInfo[]>(
-    WHISPER_MODEL_CATALOG.map((m) => ({ ...m, downloaded: false }))
+    WHISPER_MODEL_CATALOG.map((m) => ({ ...m, downloaded: false, status: 'missing' }))
   );
+  const [modelsLoaded, setModelsLoaded] = useState<boolean>(false);
   const [downloadProgress, setDownloadProgress] = useState<WhisperDownloadProgress | null>(null);
   const [isDownloadingModel, setIsDownloadingModel] = useState<boolean>(false);
   const [contextStats, setContextStats] = useState<ContextFolderStats | null>(null);
@@ -101,8 +185,36 @@ export const SettingsView: React.FC = () => {
   } | null>(null);
 
   const activeTestStreamRef = useRef<MediaStream | null>(null);
+  const readinessRequestRef = useRef<number>(0);
+  const llmTestGenerationRef = useRef<number>(0);
+  const llmConfigSignatureRef = useRef<string>(getLlmConfigSignature(DEFAULT_SETTINGS));
+  const launchErrorRef = useRef<HTMLDivElement | null>(null);
+  const settingsGenerationRef = useRef(0);
 
   const t = TRANSLATIONS[settings.language || 'en'];
+
+  const refreshReadiness = async (): Promise<CopilotReadiness | null> => {
+    if (!window.electronAPI) return null;
+    const requestId = ++readinessRequestRef.current;
+    setIsRefreshingReadiness(true);
+    try {
+      const nextReadiness = await window.electronAPI.getCopilotReadiness();
+      if (requestId === readinessRequestRef.current) {
+        setReadiness(nextReadiness);
+        setReadinessError(false);
+      }
+      return nextReadiness;
+    } catch {
+      if (requestId === readinessRequestRef.current) {
+        setReadinessError(true);
+      }
+      return null;
+    } finally {
+      if (requestId === readinessRequestRef.current) {
+        setIsRefreshingReadiness(false);
+      }
+    }
+  };
 
   // Clean up any active media stream if window unloads or component unmounts
   useEffect(() => {
@@ -128,14 +240,15 @@ export const SettingsView: React.FC = () => {
     if (window.electronAPI) {
       window.electronAPI.getSettings().then((loaded) => {
         setSettings(loaded);
-        if (loaded.appMode === 'copilot') {
-          setActiveTab('copilot');
-        }
+        llmConfigSignatureRef.current = getLlmConfigSignature(loaded);
+        setActiveTab(loaded.appMode === 'copilot' ? 'copilot' : 'script');
         if (loaded.contextFolderPath) {
-          window.electronAPI?.getContextStats(loaded.contextFolderPath).then((stats) => {
+          window.electronAPI?.getContextStats().then((stats) => {
             setContextStats(stats);
+            void refreshReadiness();
           });
         }
+        void refreshReadiness();
       });
 
       if (window.electronAPI.checkPermissions) {
@@ -152,24 +265,64 @@ export const SettingsView: React.FC = () => {
         setDisplays(d);
       });
 
-      window.electronAPI.getWhisperModels().then((models) => {
-        if (models && models.length > 0) {
-          setWhisperModels(models);
-        }
-      });
+      window.electronAPI
+        .getWhisperModels()
+        .then((models) => {
+          if (models && models.length > 0) {
+            setWhisperModels(models);
+          }
+        })
+        .finally(() => setModelsLoaded(true));
 
       const unsubDownload = window.electronAPI.onWhisperDownloadProgress((prog) => {
         setDownloadProgress(prog);
-        if (prog.status === 'ready' || prog.status === 'error') {
+        setWhisperModels((current) =>
+          current.map((model) =>
+            model.id === prog.modelId
+              ? {
+                  ...model,
+                  status:
+                    prog.status === 'downloading' || prog.status === 'validating'
+                      ? 'loading'
+                      : prog.status === 'ready'
+                        ? 'ready'
+                        : prog.status === 'error'
+                          ? 'error'
+                          : model.status,
+                  ...(prog.status === 'error' ? { error: prog.error } : {})
+                }
+              : model
+          )
+        );
+        setIsDownloadingModel(
+          prog.status === 'downloading' || prog.status === 'validating'
+        );
+        if (
+          prog.status === 'ready' ||
+          prog.status === 'error' ||
+          prog.status === 'cancelled'
+        ) {
           setIsDownloadingModel(false);
+          if (prog.status === 'ready') setLaunchBlockers([]);
           window.electronAPI?.getWhisperModels().then((m) => {
-            if (m) setWhisperModels(m);
+            if (m) {
+              setWhisperModels(m);
+              setModelsLoaded(true);
+            }
           });
         }
+        void refreshReadiness();
       });
 
       const unsubSettings = window.electronAPI.onSettingsUpdated((updated) => {
+        const nextSignature = getLlmConfigSignature(updated);
+        if (nextSignature !== llmConfigSignatureRef.current) {
+          llmConfigSignatureRef.current = nextSignature;
+          llmTestGenerationRef.current += 1;
+          setLlmTestResult(null);
+        }
         setSettings(updated);
+        settingsGenerationRef.current += 1;
       });
 
       return () => {
@@ -187,9 +340,9 @@ export const SettingsView: React.FC = () => {
         .then((devices) => {
           const mics = devices
             .filter((d) => d.kind === 'audioinput')
-            .map((d, index) => ({
+            .map((d) => ({
               deviceId: d.deviceId,
-              label: d.label || `Microphone ${index + 1}`
+              label: d.label
             }));
           setAvailableMics(mics);
         })
@@ -210,21 +363,156 @@ export const SettingsView: React.FC = () => {
   }, [settings.text]);
 
   const updateSetting = <K extends keyof PrompterSettings>(key: K, value: PrompterSettings[K]) => {
+    settingsGenerationRef.current += 1;
     const nextSettings = { ...settings, [key]: value };
     setSettings(nextSettings);
+    setLaunchBlockers([]);
+
+    if (LLM_CONFIG_KEYS.has(key)) {
+      llmConfigSignatureRef.current = getLlmConfigSignature(nextSettings);
+      llmTestGenerationRef.current += 1;
+      setLlmTestResult(null);
+    }
+    if (key === 'captureSystemAudio' || key === 'captureMicAudio' || key === 'micDeviceId') {
+      setTestMessage(null);
+    }
 
     if (window.electronAPI) {
-      window.electronAPI.saveSettings({ [key]: value });
+      const save = window.electronAPI.saveSettings({ [key]: value });
+      if (READINESS_SETTING_KEYS.has(key)) {
+        void save.then(() => refreshReadiness());
+      }
       setIsSaved(true);
       setTimeout(() => setIsSaved(false), 1500);
     }
   };
 
+  const getReadinessTitle = (id: CopilotReadinessItemId): string => {
+    switch (id) {
+      case 'llm':
+        return t.readinessLlmTitle;
+      case 'audio':
+        return t.readinessAudioTitle;
+      case 'stt':
+        return t.readinessSttTitle;
+      case 'project':
+        return t.readinessProjectTitle;
+    }
+  };
+
+  const focusLaunchError = () => {
+    requestAnimationFrame(() => launchErrorRef.current?.focus());
+  };
+
   const handleLaunch = async () => {
     if (!window.electronAPI || isLaunching) return;
+    const launchGeneration = settingsGenerationRef.current;
+    const launchSettings = { ...settings };
     setIsLaunching(true);
     try {
-      await window.electronAPI.startPrompter(settings);
+      if (launchSettings.appMode === 'copilot') {
+        let latestReadiness: CopilotReadiness;
+        let latestModels: WhisperModelInfo[];
+        try {
+          await window.electronAPI.saveSettings(launchSettings);
+          [latestReadiness, latestModels] = await Promise.all([
+            window.electronAPI.getCopilotReadiness(),
+            window.electronAPI.getWhisperModels()
+          ]);
+        } catch {
+          setReadinessError(true);
+          setLaunchBlockers([t.readinessUnavailable]);
+          setActiveTab('copilot');
+          focusLaunchError();
+          return;
+        }
+
+        readinessRequestRef.current += 1;
+        setReadiness(latestReadiness);
+        setReadinessError(false);
+        setWhisperModels(latestModels);
+        setModelsLoaded(true);
+
+        const blockerIds = new Set<CopilotReadinessItemId>();
+        latestReadiness.items.forEach((item) => {
+          if (item.id !== 'project' && item.status === 'blocked') blockerIds.add(item.id);
+        });
+
+        try {
+          const connectionResult = await window.electronAPI.testLLMConnection(launchSettings);
+          setLlmTestResult({
+            success: connectionResult.success,
+            message: connectionResult.success
+              ? t.connectionSuccess
+              : connectionResult.message || t.connectionFailed
+          });
+          if (!connectionResult.success) blockerIds.add('llm');
+        } catch (error: unknown) {
+          setLlmTestResult({
+            success: false,
+            message: getErrorMessage(error, t.connectionFailed)
+          });
+          blockerIds.add('llm');
+        }
+
+        if (launchSettings.sttProvider === 'local-whisper') {
+          const selectedModel = latestModels.find(
+            (model) => model.id === launchSettings.localWhisperModel
+          );
+          const selectedProgress =
+            downloadProgress?.modelId === launchSettings.localWhisperModel ? downloadProgress : null;
+          const progressBlocksLaunch =
+            selectedProgress?.status === 'downloading' ||
+            selectedProgress?.status === 'validating' ||
+            selectedProgress?.status === 'error';
+          if (!isWhisperModelReady(selectedModel) || progressBlocksLaunch) {
+            blockerIds.add('stt');
+          } else {
+            const prepared = await window.electronAPI.downloadWhisperModel(
+              launchSettings.localWhisperModel
+            );
+            if (!prepared.success) {
+              blockerIds.add('stt');
+              if (!prepared.cancelled) {
+                setDownloadProgress({
+                  modelId: launchSettings.localWhisperModel,
+                  status: 'error',
+                  progress: 0,
+                  error: prepared.error || t.modelDownloadErrorFallback
+                });
+              }
+            }
+          }
+        }
+
+        if (testMessage && !testMessage.success && testMessage.type !== 'accessibility') {
+          const testedSourceEnabled =
+            testMessage.type === 'system'
+              ? launchSettings.captureSystemAudio
+              : launchSettings.captureMicAudio;
+          const alternateSourceEnabled =
+            testMessage.type === 'system'
+              ? launchSettings.captureMicAudio
+              : launchSettings.captureSystemAudio;
+          if (testedSourceEnabled && !alternateSourceEnabled) blockerIds.add('audio');
+        }
+
+        if (blockerIds.size > 0) {
+          setLaunchBlockers(Array.from(blockerIds, getReadinessTitle));
+          setActiveTab('copilot');
+          focusLaunchError();
+          return;
+        }
+        setLaunchBlockers([]);
+      }
+
+      if (settingsGenerationRef.current !== launchGeneration) {
+        setLaunchBlockers([t.launchSettingsChanged]);
+        setActiveTab(launchSettings.appMode === 'copilot' ? 'copilot' : 'script');
+        focusLaunchError();
+        return;
+      }
+      await window.electronAPI.startPrompter(launchSettings);
     } finally {
       setIsLaunching(false);
     }
@@ -272,17 +560,25 @@ export const SettingsView: React.FC = () => {
       yPosition
     };
 
+    settingsGenerationRef.current += 1;
     setSettings((prev) => ({ ...prev, ...updated }));
     if (window.electronAPI) {
       window.electronAPI.saveSettings(updated);
     }
   };
 
-  const handleResetDefaults = () => {
+  const handleResetDefaults = async () => {
     if (confirm(t.resetConfirm)) {
-      setSettings(DEFAULT_SETTINGS);
+      settingsGenerationRef.current += 1;
       if (window.electronAPI) {
-        window.electronAPI.saveSettings(DEFAULT_SETTINGS);
+        await window.electronAPI.clearContextFolder();
+        const savedDefaults = await window.electronAPI.saveSettings(DEFAULT_SETTINGS);
+        setSettings(savedDefaults);
+        setContextStats(null);
+        setLaunchBlockers([]);
+        void refreshReadiness();
+      } else {
+        setSettings(DEFAULT_SETTINGS);
       }
     }
   };
@@ -295,10 +591,12 @@ export const SettingsView: React.FC = () => {
       const statsResult = await window.electronAPI.selectContextFolder();
       setContextStats(statsResult);
       if (statsResult?.folderPath) {
+        settingsGenerationRef.current += 1;
         setSettings((prev) => ({ ...prev, contextFolderPath: statsResult.folderPath }));
       }
     } finally {
       setIsIndexingFolder(false);
+      void refreshReadiness();
     }
   };
 
@@ -310,6 +608,7 @@ export const SettingsView: React.FC = () => {
       setContextStats(statsResult);
     } finally {
       setIsIndexingFolder(false);
+      void refreshReadiness();
     }
   };
 
@@ -324,28 +623,72 @@ export const SettingsView: React.FC = () => {
     });
 
     try {
-      await window.electronAPI.downloadWhisperModel(modelId);
-    } catch {
+      const result = await window.electronAPI.downloadWhisperModel(modelId);
+      if (!result.success && !result.cancelled) {
+        setDownloadProgress({
+          modelId,
+          status: 'error',
+          progress: 0,
+          error: result.error || t.modelDownloadErrorFallback
+        });
+      } else if (result.cancelled) {
+        setDownloadProgress({ modelId, status: 'cancelled', progress: 0 });
+      }
+    } catch (error: unknown) {
+      setDownloadProgress({
+        modelId,
+        status: 'error',
+        progress: 0,
+        error: getErrorMessage(error, t.modelDownloadErrorFallback)
+      });
+    } finally {
       setIsDownloadingModel(false);
+      const models = await window.electronAPI.getWhisperModels();
+      setWhisperModels(models);
+      setModelsLoaded(true);
+      void refreshReadiness();
+    }
+  };
+
+  const handleCancelModelDownload = async (modelId: LocalWhisperModelId) => {
+    if (!window.electronAPI) return;
+    const result = await window.electronAPI.cancelWhisperModelDownload(modelId);
+    if (result.success) {
+      setDownloadProgress({ modelId, status: 'cancelled', progress: 0 });
+      setIsDownloadingModel(false);
+      const models = await window.electronAPI.getWhisperModels();
+      setWhisperModels(models);
+      setModelsLoaded(true);
+      void refreshReadiness();
     }
   };
 
   // Test LLM Connection
   const handleTestLLM = async () => {
     if (!window.electronAPI || testingLLM) return;
+    const testGeneration = ++llmTestGenerationRef.current;
     setTestingLLM(true);
     setLlmTestResult(null);
 
     try {
       const res = await window.electronAPI.testLLMConnection(settings);
-      setLlmTestResult(res);
-    } catch (err: any) {
-      setLlmTestResult({
-        success: false,
-        message: err?.message || t.connectionFailed
-      });
+      if (testGeneration === llmTestGenerationRef.current) {
+        setLlmTestResult({
+          success: res.success,
+          message: res.success ? t.connectionSuccess : res.message || t.connectionFailed
+        });
+        if (res.success) setLaunchBlockers([]);
+      }
+    } catch (error: unknown) {
+      if (testGeneration === llmTestGenerationRef.current) {
+        setLlmTestResult({
+          success: false,
+          message: getErrorMessage(error, t.connectionFailed)
+        });
+      }
     } finally {
       setTestingLLM(false);
+      void refreshReadiness();
     }
   };
 
@@ -361,6 +704,7 @@ export const SettingsView: React.FC = () => {
         setContextStats(statsResult);
         if (statsResult?.folderPath) {
           folderPath = statsResult.folderPath;
+          settingsGenerationRef.current += 1;
           setSettings((prev) => ({ ...prev, contextFolderPath: statsResult.folderPath }));
         }
       } finally {
@@ -379,6 +723,7 @@ export const SettingsView: React.FC = () => {
         contextFolderPath: folderPath
       });
       if (res.success && res.notes) {
+        settingsGenerationRef.current += 1;
         setSettings((prev) => ({ ...prev, contextCustomNotes: res.notes! }));
         setAnalyzeResult({
           success: true,
@@ -390,18 +735,23 @@ export const SettingsView: React.FC = () => {
           message: res.error || t.connectionFailed
         });
       }
-    } catch (err: any) {
+    } catch (error: unknown) {
       setAnalyzeResult({
         success: false,
-        message: err?.message || t.connectionFailed
+        message: getErrorMessage(error, t.connectionFailed)
       });
     } finally {
       setIsAnalyzingProject(false);
+      void refreshReadiness();
     }
   };
 
-  const isNonMac =
-    typeof navigator !== 'undefined' && !navigator.userAgent.toLowerCase().includes('mac');
+  const isMac =
+    typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac');
+  const isNonMac = typeof navigator !== 'undefined' && !isMac;
+  const isWindows =
+    typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('windows');
+  const supportsSystemLoopback = !isNonMac || isWindows;
 
   // Convert electron accelerator to readable symbols for macOS, Windows, or Linux
   const formatHotkey = (accelerator: string) => {
@@ -447,6 +797,7 @@ export const SettingsView: React.FC = () => {
       setPermissions(status);
     } finally {
       setIsCheckingPermissions(false);
+      void refreshReadiness();
     }
   };
 
@@ -519,15 +870,16 @@ export const SettingsView: React.FC = () => {
 
       setTestMessage({
         type: 'mic',
-        success: true,
-        text: maxLevel > 2 ? t.micActive : `${t.permissionGranted} (${t.micPermissionPrompt})`
+        success: maxLevel > 2,
+        text: maxLevel > 2 ? t.micActive : t.micNoSignal
       });
-    } catch (err: any) {
-      console.warn('[SettingsView] Mic test error:', err);
+      if (maxLevel > 2) setLaunchBlockers([]);
+    } catch (error: unknown) {
+      console.warn('[SettingsView] Mic test error:', error);
       setTestMessage({
         type: 'mic',
         success: false,
-        text: err?.message || t.permissionDenied
+        text: getErrorMessage(error, t.permissionDenied)
       });
       if (window.electronAPI?.checkPermissions) {
         const p = await window.electronAPI.checkPermissions();
@@ -544,6 +896,7 @@ export const SettingsView: React.FC = () => {
       }
       setTestingAudioSource(null);
       setTestAudioLevel(0);
+      void refreshReadiness();
     }
   };
 
@@ -556,21 +909,78 @@ export const SettingsView: React.FC = () => {
     let stream: MediaStream | null = null;
     let audioCtx: AudioContext | null = null;
     let animFrameId: number | null = null;
+    let nativeCaptureStarted = false;
+    let unsubscribeNativeData: (() => void) | null = null;
+    let unsubscribeNativeError: (() => void) | null = null;
 
     try {
+      const api = window.electronAPI;
+      if (isMac && api) {
+        let maxLevel = 0;
+        let captureError: string | null = null;
+        let resolveFirstChunk: (() => void) | null = null;
+        const firstChunk = new Promise<void>((resolve) => {
+          resolveFirstChunk = resolve;
+        });
+
+        unsubscribeNativeData = api.onSystemAudioData((chunk) => {
+          const samples = decodePcm16Le(chunk.data);
+          if (samples.length === 0) return;
+          resolveFirstChunk?.();
+          resolveFirstChunk = null;
+
+          let sumSquares = 0;
+          for (let index = 0; index < samples.length; index += 1) {
+            sumSquares += samples[index] * samples[index];
+          }
+          const rms = Math.sqrt(sumSquares / samples.length);
+          const level = Math.min(100, Math.round(Math.sqrt(rms) * 280));
+          setTestAudioLevel(level);
+          if (level > maxLevel) maxLevel = level;
+        });
+        unsubscribeNativeError = api.onSystemAudioError((message) => {
+          captureError = message;
+          resolveFirstChunk?.();
+          resolveFirstChunk = null;
+        });
+
+        const result = await api.startSystemAudioCapture();
+        if (!result.success) {
+          throw new Error(result.error || t.systemAudioNoTrack);
+        }
+        nativeCaptureStarted = true;
+
+        await Promise.race([
+          firstChunk,
+          new Promise<void>((_, reject) =>
+            setTimeout(
+              () => reject(new Error('macOS did not start system audio capture. Check System Audio Recording permission.')),
+              30000
+            )
+          )
+        ]);
+        if (captureError) throw new Error(captureError);
+
+        await new Promise((resolve) => setTimeout(resolve, 4000));
+        if (captureError) throw new Error(captureError);
+        setTestMessage({
+          type: 'system',
+          success: maxLevel > 2,
+          text: maxLevel > 2 ? t.systemAudioActive : t.systemAudioNoSignal
+        });
+        if (maxLevel > 2) setLaunchBlockers([]);
+        return;
+      }
+
       stream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
-        audio: {
-          autoGainControl: false,
-          echoCancellation: false,
-          noiseSuppression: false
-        }
+        audio: true
       });
       activeTestStreamRef.current = stream;
 
       const audioTracks = stream.getAudioTracks();
-      if (audioTracks.length === 0) {
-        throw new Error('Аудиопоток не получен. Разрешите «Запись экрана» (Screen Recording) для Cyrano.');
+      if (audioTracks.length === 0 || audioTracks[0].readyState === 'ended') {
+        throw new Error(t.systemAudioNoTrack);
       }
 
       stream.getVideoTracks().forEach((vt) => {
@@ -617,21 +1027,33 @@ export const SettingsView: React.FC = () => {
 
       setTestMessage({
         type: 'system',
-        success: true,
-        text: t.systemAudioActive
+        success: maxLevel > 2,
+        text: maxLevel > 2 ? t.systemAudioActive : t.systemAudioNoSignal
       });
-    } catch (err: any) {
-      console.warn('[SettingsView] System audio test error:', err);
+      if (maxLevel > 2) setLaunchBlockers([]);
+    } catch (error: unknown) {
+      console.warn('[SettingsView] System audio test error:', error);
       setTestMessage({
         type: 'system',
         success: false,
-        text: err?.message || t.permissionDenied
+        text:
+          error instanceof DOMException &&
+          (error.name === 'NotAllowedError' ||
+            error.name === 'SecurityError' ||
+            (error.name === 'AbortError' && /invalid capture constraints/i.test(error.message)))
+            ? t.systemAudioNoTrack
+            : getErrorMessage(error, t.permissionDenied)
       });
       if (window.electronAPI?.checkPermissions) {
         const p = await window.electronAPI.checkPermissions();
         setPermissions(p);
       }
     } finally {
+      unsubscribeNativeData?.();
+      unsubscribeNativeError?.();
+      if (nativeCaptureStarted) {
+        void window.electronAPI?.stopSystemAudioCapture();
+      }
       if (animFrameId) cancelAnimationFrame(animFrameId);
       if (stream) {
         stream.getTracks().forEach((tr) => tr.stop());
@@ -642,6 +1064,7 @@ export const SettingsView: React.FC = () => {
       }
       setTestingAudioSource(null);
       setTestAudioLevel(0);
+      void refreshReadiness();
     }
   };
 
@@ -659,11 +1082,11 @@ export const SettingsView: React.FC = () => {
         success: ok,
         text: ok ? t.accessibilityActive : t.permissionDenied
       });
-    } catch (err: any) {
+    } catch (error: unknown) {
       setTestMessage({
         type: 'accessibility',
         success: false,
-        text: err?.message || t.permissionDenied
+        text: getErrorMessage(error, t.permissionDenied)
       });
     } finally {
       setTestingAudioSource(null);
@@ -708,6 +1131,14 @@ export const SettingsView: React.FC = () => {
     }
   };
 
+  const systemAudioPermissionState: PermissionState = isMac
+    ? testMessage?.type === 'system'
+      ? testMessage.success
+        ? 'granted'
+        : 'denied'
+      : 'unknown'
+    : permissions.screen;
+
   const renderPermissionsCard = () => (
     <div className="card-box">
       <div className="card-title justify-between">
@@ -735,7 +1166,7 @@ export const SettingsView: React.FC = () => {
               <div className="min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-xs font-semibold text-white">{t.permissionScreenLabel}</span>
-                  {renderPermissionBadge(permissions.screen)}
+                  {renderPermissionBadge(systemAudioPermissionState)}
                 </div>
                 <p className="text-[11px] text-slate-400 mt-0.5 leading-snug">{t.permissionScreenHint}</p>
               </div>
@@ -760,7 +1191,9 @@ export const SettingsView: React.FC = () => {
                 </span>
               </button>
 
-              {permissions.screen !== 'granted' && permissions.screen !== 'not-needed' && (
+              {(!isNonMac ||
+                (permissions.screen !== 'granted' && permissions.screen !== 'not-needed') ||
+                (testMessage?.type === 'system' && !testMessage.success)) && (
                 <button
                   onClick={() => handleOpenSettings('screen')}
                   className="btn-secondary text-[11px] text-slate-300 hover:text-white"
@@ -785,7 +1218,7 @@ export const SettingsView: React.FC = () => {
               </div>
               <div className="w-full bg-[#1e2433] h-2 rounded-full overflow-hidden">
                 <div
-                  className="bg-gradient-to-r from-blue-500 via-indigo-400 to-emerald-400 h-full transition-all duration-75"
+                  className="bg-blue-500 h-full transition-all duration-75"
                   style={{ width: `${Math.max(6, testAudioLevel)}%` }}
                 />
               </div>
@@ -805,8 +1238,10 @@ export const SettingsView: React.FC = () => {
               <button
                 onClick={() => setTestMessage(null)}
                 className="text-[10px] text-slate-400 hover:text-white ml-2 cursor-pointer"
+                aria-label={t.dismissMessageLabel}
+                title={t.dismissMessageLabel}
               >
-                ✕
+                <X className="w-3.5 h-3.5" />
               </button>
             </div>
           )}
@@ -870,7 +1305,7 @@ export const SettingsView: React.FC = () => {
               </div>
               <div className="w-full bg-[#1e2433] h-2 rounded-full overflow-hidden">
                 <div
-                  className="bg-gradient-to-r from-emerald-500 via-teal-400 to-blue-400 h-full transition-all duration-75"
+                  className="bg-emerald-500 h-full transition-all duration-75"
                   style={{ width: `${Math.max(6, testAudioLevel)}%` }}
                 />
               </div>
@@ -890,8 +1325,10 @@ export const SettingsView: React.FC = () => {
               <button
                 onClick={() => setTestMessage(null)}
                 className="text-[10px] text-slate-400 hover:text-white ml-2 cursor-pointer"
+                aria-label={t.dismissMessageLabel}
+                title={t.dismissMessageLabel}
               >
-                ✕
+                <X className="w-3.5 h-3.5" />
               </button>
             </div>
           )}
@@ -956,8 +1393,10 @@ export const SettingsView: React.FC = () => {
               <button
                 onClick={() => setTestMessage(null)}
                 className="text-[10px] text-slate-400 hover:text-white ml-2 cursor-pointer"
+                aria-label={t.dismissMessageLabel}
+                title={t.dismissMessageLabel}
               >
-                ✕
+                <X className="w-3.5 h-3.5" />
               </button>
             </div>
           )}
@@ -985,7 +1424,7 @@ export const SettingsView: React.FC = () => {
       </div>
 
       <div className="space-y-2">
-        <div className="flex items-center gap-2">
+        <div className="project-folder-controls flex items-center gap-2">
           <input
             type="text"
             readOnly
@@ -1006,7 +1445,8 @@ export const SettingsView: React.FC = () => {
               onClick={handleRefreshFolder}
               disabled={isIndexingFolder || isAnalyzingProject}
               className="btn-secondary px-2.5"
-              title="Refresh Folder"
+              title={t.refreshFolderLabel}
+              aria-label={t.refreshFolderLabel}
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isIndexingFolder ? 'animate-spin' : ''}`} />
             </button>
@@ -1053,6 +1493,385 @@ export const SettingsView: React.FC = () => {
     </div>
   );
 
+  const selectedWhisperModel = whisperModels.find(
+    (model) => model.id === settings.localWhisperModel
+  );
+  const selectedModelProgress =
+    downloadProgress?.modelId === settings.localWhisperModel ? downloadProgress : null;
+  const selectedModelNeedsRecovery =
+    !isWhisperModelReady(selectedWhisperModel) || selectedModelProgress?.status === 'error';
+
+  const getBackendReadinessStatus = (id: CopilotReadinessItemId): CopilotReadinessStatus =>
+    readiness?.items.find((item) => item.id === id)?.status ?? 'checking';
+
+  const llmConfigured = Boolean(
+    settings.llmBaseUrl.trim() &&
+      settings.llmModel.trim() &&
+      (settings.llmApiKey.trim() ||
+        /(?:localhost|127\.0\.0\.1|0\.0\.0\.0)/.test(settings.llmBaseUrl))
+  );
+  const llmProtocol =
+    settings.llmProvider === 'anthropic'
+      ? t.providerProtocolAnthropic
+      : t.providerProtocolOpenAI;
+  const llmCredentialDetail = settings.llmApiKey.trim()
+    ? t.readinessApiKeyConfigured
+    : t.readinessApiKeyNotRequired;
+  const llmTargetDetail = `${llmProtocol} · ${settings.llmModel || t.modelLabel} · ${settings.llmBaseUrl || t.customBaseUrlLabel} · ${llmCredentialDetail}`;
+  const llmStatus: CopilotReadinessStatus = testingLLM
+    ? 'checking'
+    : llmTestResult
+      ? llmTestResult.success
+        ? 'ready'
+        : 'blocked'
+      : getBackendReadinessStatus('llm') === 'ready'
+        ? 'warning'
+        : getBackendReadinessStatus('llm');
+  const llmDetail = testingLLM
+    ? t.testingConnection
+    : llmTestResult
+      ? llmTestResult.success
+        ? `${llmTargetDetail} · ${t.connectionSuccess}`
+        : `${t.connectionFailed}: ${llmTestResult.message}`
+      : llmConfigured
+        ? `${llmTargetDetail} · ${t.readinessLlmConfigured}`
+        : t.readinessLlmNotConfigured;
+
+  const enabledAudioSources = Number(settings.captureSystemAudio) + Number(settings.captureMicAudio);
+  const systemOnlyUnsupported =
+    !supportsSystemLoopback && settings.captureSystemAudio && !settings.captureMicAudio;
+  const autoTriggerNeedsSystem =
+    settings.copilotTriggerMode === 'auto' &&
+    (!supportsSystemLoopback || !settings.captureSystemAudio);
+  const currentAudioTest =
+    testMessage?.type === 'system' || testMessage?.type === 'mic' ? testMessage : null;
+  const testedAudioSourceEnabled =
+    currentAudioTest?.type === 'system'
+      ? settings.captureSystemAudio
+      : currentAudioTest?.type === 'mic'
+        ? settings.captureMicAudio
+        : false;
+  const audioStatus: CopilotReadinessStatus =
+    testingAudioSource === 'system' || testingAudioSource === 'mic'
+      ? 'checking'
+      : enabledAudioSources === 0
+        ? 'blocked'
+        : systemOnlyUnsupported || autoTriggerNeedsSystem || getBackendReadinessStatus('audio') === 'blocked'
+          ? 'blocked'
+        : currentAudioTest && testedAudioSourceEnabled
+          ? currentAudioTest.success
+            ? 'ready'
+            : enabledAudioSources === 1
+              ? 'blocked'
+              : 'warning'
+          : 'warning';
+  const audioDetail =
+    autoTriggerNeedsSystem
+      ? t.readinessAutoNeedsSystem
+      : systemOnlyUnsupported
+      ? t.readinessSystemLoopbackUnsupported
+      : testingAudioSource === 'system'
+      ? t.testingSystemAudio
+      : testingAudioSource === 'mic'
+        ? t.testingMic
+        : currentAudioTest && testedAudioSourceEnabled
+          ? currentAudioTest.text
+          : settings.captureSystemAudio && settings.captureMicAudio
+            ? t.readinessAudioBothConfigured
+            : settings.captureSystemAudio
+              ? t.readinessAudioSystemConfigured
+              : settings.captureMicAudio
+                ? t.readinessAudioMicConfigured
+                : t.readinessAudioNotConfigured;
+
+  let sttStatus: CopilotReadinessStatus;
+  let sttDetail: string;
+  if (settings.sttProvider === 'local-whisper') {
+    const modelStatus = selectedWhisperModel?.status ??
+      (selectedWhisperModel?.downloaded ? 'ready' : 'missing');
+    if (!modelsLoaded) {
+      sttStatus = 'checking';
+      sttDetail = t.readinessChecking;
+    } else if (selectedModelProgress?.status === 'downloading') {
+      sttStatus = 'checking';
+      sttDetail = `${t.readinessSttDownloading} · ${selectedModelProgress.progress}%`;
+    } else if (selectedModelProgress?.status === 'validating' || modelStatus === 'loading') {
+      sttStatus = 'checking';
+      sttDetail = t.readinessSttValidating;
+    } else if (selectedModelProgress?.status === 'error' || modelStatus === 'error') {
+      sttStatus = 'blocked';
+      sttDetail =
+        selectedModelProgress?.error || selectedWhisperModel?.error || t.readinessSttFailed;
+    } else if (isWhisperModelReady(selectedWhisperModel)) {
+      sttStatus = selectedWhisperModel?.selected ? 'ready' : 'warning';
+      sttDetail = `${getWhisperName(settings.localWhisperModel, t)} · ${t.readinessSttLocalReady}`;
+    } else if (modelStatus === 'partial') {
+      sttStatus = 'blocked';
+      sttDetail = t.readinessSttPartial;
+    } else {
+      sttStatus = 'blocked';
+      sttDetail = t.readinessSttFailed;
+    }
+  } else {
+    const cloudConfigured = Boolean((settings.cloudSttApiKey || settings.llmApiKey).trim());
+    sttStatus =
+      getBackendReadinessStatus('stt') === 'checking'
+        ? 'checking'
+        : cloudConfigured
+          ? 'warning'
+          : 'blocked';
+    sttDetail = cloudConfigured
+      ? `${settings.cloudSttModel || 'whisper-1'} · ${t.readinessSttCloudConfigured}`
+      : t.readinessSttNotConfigured;
+  }
+
+  const projectStatus: CopilotReadinessStatus =
+    isIndexingFolder || isAnalyzingProject
+      ? 'checking'
+      : contextStats?.fileCount
+        ? 'ready'
+        : 'warning';
+  const projectLocale =
+    settings.language === 'ru' ? 'ru-RU' : settings.language === 'uk' ? 'uk-UA' : 'en-US';
+  const projectDetail = contextStats?.fileCount
+    ? `${contextStats.folderPath} · ${contextStats.fileCount} ${t.filesIndexed} · ${t.readinessProjectUpdated} ${new Intl.DateTimeFormat(projectLocale, {
+        dateStyle: 'medium',
+        timeStyle: 'short'
+      }).format(contextStats.indexedAt)}`
+    : t.readinessProjectMissing;
+
+  const handleReadinessAudio = () => {
+    setActiveTab('audio-context');
+    if (testingAudioSource) return;
+    if (settings.captureSystemAudio) {
+      void handleTestSystemAudio();
+    } else if (settings.captureMicAudio) {
+      void handleTestMicrophone();
+    }
+  };
+
+  const handleReadinessStt = () => {
+    setActiveTab('audio-context');
+    if (
+      settings.sttProvider === 'local-whisper' &&
+      selectedModelNeedsRecovery &&
+      selectedModelProgress?.status !== 'downloading' &&
+      selectedModelProgress?.status !== 'validating'
+    ) {
+      void handleDownloadModel(settings.localWhisperModel);
+    }
+  };
+
+  const handleReadinessProject = () => {
+    setActiveTab('audio-context');
+    if (settings.contextFolderPath) {
+      void handleRefreshFolder();
+    } else {
+      void handleSelectFolder();
+    }
+  };
+
+  const getStatusLabel = (status: CopilotReadinessStatus): string => {
+    switch (status) {
+      case 'ready':
+        return t.readinessStatusReady;
+      case 'warning':
+        return t.readinessStatusWarning;
+      case 'blocked':
+        return t.readinessStatusBlocked;
+      case 'checking':
+        return t.readinessStatusChecking;
+    }
+  };
+
+  const getModelStatusLabel = (status: NonNullable<WhisperModelInfo['status']>): string => {
+    switch (status) {
+      case 'ready':
+        return t.modelReady;
+      case 'missing':
+        return t.modelStatusMissing;
+      case 'partial':
+        return t.modelStatusPartial;
+      case 'loading':
+        return t.modelStatusLoading;
+      case 'error':
+        return t.modelStatusError;
+    }
+  };
+
+  const renderReadinessIcon = (status: CopilotReadinessStatus) => {
+    switch (status) {
+      case 'ready':
+        return <CheckCircle2 aria-hidden="true" />;
+      case 'warning':
+        return <AlertTriangle aria-hidden="true" />;
+      case 'blocked':
+        return <XCircle aria-hidden="true" />;
+      case 'checking':
+        return <LoaderCircle className="animate-spin" aria-hidden="true" />;
+    }
+  };
+
+  const readinessRows: Array<{
+    id: CopilotReadinessItemId;
+    status: CopilotReadinessStatus;
+    detail: string;
+    actionLabel: string;
+    action: () => void;
+    disabled: boolean;
+  }> = [
+    {
+      id: 'llm',
+      status: llmStatus,
+      detail: llmDetail,
+      actionLabel: testingLLM ? t.testingConnection : t.readinessTestLlm,
+      action: () => void handleTestLLM(),
+      disabled: testingLLM
+    },
+    {
+      id: 'audio',
+      status: audioStatus,
+      detail: audioDetail,
+      actionLabel:
+        testingAudioSource === 'system' || testingAudioSource === 'mic'
+          ? testingAudioSource === 'system'
+            ? t.testingSystemAudio
+            : t.testingMic
+          : t.readinessTestAudio,
+      action: handleReadinessAudio,
+      disabled: Boolean(testingAudioSource)
+    },
+    {
+      id: 'stt',
+      status: sttStatus,
+      detail: sttDetail,
+      actionLabel:
+        settings.sttProvider === 'local-whisper' &&
+        selectedModelNeedsRecovery &&
+        selectedModelProgress?.status !== 'downloading' &&
+        selectedModelProgress?.status !== 'validating'
+          ? selectedModelProgress?.status === 'error' || selectedWhisperModel?.status === 'error'
+            ? t.retryButton
+            : t.downloadModelButton
+          : t.readinessManageStt,
+      action: handleReadinessStt,
+      disabled: false
+    },
+    {
+      id: 'project',
+      status: projectStatus,
+      detail: projectDetail,
+      actionLabel: settings.contextFolderPath
+        ? t.readinessRefreshProject
+        : t.readinessChooseProject,
+      action: handleReadinessProject,
+      disabled: isIndexingFolder || isAnalyzingProject
+    }
+  ];
+
+  const hasReadinessBlocker =
+    readinessError ||
+    readinessRows.some((row) => row.id !== 'project' && row.status === 'blocked');
+  const hasReadinessChecking =
+    isRefreshingReadiness || readinessRows.some((row) => row.status === 'checking');
+  const hasProjectWarning = projectStatus === 'warning';
+
+  const renderReadinessPanel = () => (
+    <section className="readiness-panel" aria-labelledby="readiness-title">
+      <div className="readiness-header">
+        <div>
+          <h3 id="readiness-title">{t.readinessHeading}</h3>
+          <p>{t.readinessSubheading}</p>
+        </div>
+        <button
+          type="button"
+          className="btn-secondary readiness-refresh"
+          onClick={() => void refreshReadiness()}
+          disabled={isRefreshingReadiness}
+          aria-label={t.readinessRefreshButton}
+          title={t.readinessRefreshButton}
+        >
+          <RefreshCw className={isRefreshingReadiness ? 'animate-spin' : ''} aria-hidden="true" />
+          <span>{t.readinessRefreshButton}</span>
+        </button>
+      </div>
+
+      {readinessError && (
+        <div className="readiness-fetch-error" role="alert">
+          <AlertCircle aria-hidden="true" />
+          <span>{t.readinessUnavailable}</span>
+        </div>
+      )}
+
+      <div className="readiness-list" aria-live="polite">
+        {readinessRows.map((row) => (
+          <div key={row.id} className={`readiness-row status-${row.status}`}>
+            <div className="readiness-icon" title={getStatusLabel(row.status)}>
+              {renderReadinessIcon(row.status)}
+              <span className="sr-only">{getStatusLabel(row.status)}</span>
+            </div>
+            <div className="readiness-copy">
+              <div className="readiness-title-line">
+                <strong>{getReadinessTitle(row.id)}</strong>
+                <span className="readiness-status-label">{getStatusLabel(row.status)}</span>
+              </div>
+              <p className={row.id === 'project' ? 'readiness-project-detail' : undefined}>
+                {row.detail}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn-secondary readiness-action"
+              onClick={row.action}
+              disabled={row.disabled}
+            >
+              {row.actionLabel}
+            </button>
+          </div>
+        ))}
+      </div>
+
+      <div className={`readiness-launch ${hasReadinessBlocker ? 'is-blocked' : 'is-ready'}`}>
+        <div className="readiness-launch-copy">
+          <strong>
+            {hasReadinessBlocker
+              ? t.readinessLaunchBlocked
+              : hasReadinessChecking
+                ? t.readinessChecking
+                : t.readinessLaunchReady}
+          </strong>
+          <span>
+            {hasReadinessBlocker
+              ? t.readinessLaunchBlockedHint
+              : hasReadinessChecking
+                ? t.readinessChecking
+              : hasProjectWarning
+                ? t.readinessProjectOptionalHint
+                : t.readinessLaunchReadyHint}
+          </span>
+        </div>
+        <button type="button" className="btn-primary" onClick={handleLaunch} disabled={isLaunching}>
+          <Play className="w-3.5 h-3.5 fill-current" aria-hidden="true" />
+          <span>{t.launchCopilotButton}</span>
+        </button>
+      </div>
+
+      {launchBlockers.length > 0 && (
+        <div
+          ref={launchErrorRef}
+          className="launch-blocker-summary"
+          role="alert"
+          tabIndex={-1}
+        >
+          <AlertCircle aria-hidden="true" />
+          <span>
+            <strong>{t.launchBlockedSummary}:</strong> {launchBlockers.join(', ')}.
+          </span>
+        </div>
+      )}
+    </section>
+  );
+
   return (
     <div className="app-container">
       {/* Titlebar / Drag Region */}
@@ -1074,31 +1893,14 @@ export const SettingsView: React.FC = () => {
 
         {/* Action Controls & Language Switcher */}
         <div className="titlebar-controls">
-          {/* App Mode Toggle (Prompter / Copilot) */}
-          <div className="flex items-center bg-[#151922] rounded-md p-0.5 border border-[#252d3d] flex-shrink-0">
-            <button
-              onClick={() => {
-                updateSetting('appMode', 'prompter');
-                if (activeTab === 'copilot') {
-                  setActiveTab('script');
-                }
-              }}
-              className={`px-2.5 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
-                settings.appMode === 'prompter'
-                  ? 'bg-[#252d3d] text-white font-semibold'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <FileText className="w-3 h-3 flex-shrink-0" />
-              <span>{t.modePrompter}</span>
-            </button>
+          {/* App Mode Toggle (Copilot / Prompter) */}
+          <div className="mode-switcher flex items-center bg-[#151922] rounded-md p-0.5 border border-[#252d3d] flex-shrink-0">
             <button
               onClick={() => {
                 updateSetting('appMode', 'copilot');
-                if (activeTab === 'script') {
-                  setActiveTab('copilot');
-                }
+                setActiveTab('copilot');
               }}
+              aria-pressed={settings.appMode === 'copilot'}
               className={`px-2.5 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
                 settings.appMode === 'copilot'
                   ? 'bg-blue-600 text-white font-semibold'
@@ -1108,6 +1910,21 @@ export const SettingsView: React.FC = () => {
               <Bot className="w-3 h-3 flex-shrink-0" />
               <span>{t.modeCopilot}</span>
             </button>
+            <button
+              onClick={() => {
+                updateSetting('appMode', 'prompter');
+                setActiveTab('script');
+              }}
+              aria-pressed={settings.appMode === 'prompter'}
+              className={`px-2.5 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
+                settings.appMode === 'prompter'
+                  ? 'bg-[#252d3d] text-white font-semibold'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <FileText className="w-3 h-3 flex-shrink-0" />
+              <span>{t.modePrompter}</span>
+            </button>
           </div>
 
           {/* Segmented Language Switcher */}
@@ -1116,6 +1933,7 @@ export const SettingsView: React.FC = () => {
               <button
                 key={lang}
                 onClick={() => updateSetting('language', lang)}
+                aria-pressed={(settings.language || 'en') === lang}
                 className={`px-2 py-1 text-[11px] font-medium rounded transition-colors cursor-pointer whitespace-nowrap ${
                   (settings.language || 'en') === lang
                     ? 'bg-[#252d3d] text-white'
@@ -1128,16 +1946,15 @@ export const SettingsView: React.FC = () => {
             ))}
           </div>
 
-          <button onClick={handleLaunch} disabled={isLaunching} className="btn-primary">
+          <button
+            onClick={handleLaunch}
+            disabled={isLaunching}
+            className="btn-primary titlebar-launch"
+          >
             <Play className="w-3.5 h-3.5 fill-current flex-shrink-0" />
-            <span>{t.launchButton}</span>
-            <kbd className="ml-0.5 text-[10px] bg-blue-800/80 text-white border-blue-400/40">
-              {formatHotkey(
-                settings.appMode === 'copilot'
-                  ? settings.hotkeyAskAI || 'Control+Alt+Command+A'
-                  : settings.hotkeyToggle
-              )}
-            </kbd>
+            <span>
+              {settings.appMode === 'copilot' ? t.launchCopilotButton : t.launchPrompterButton}
+            </span>
           </button>
         </div>
       </div>
@@ -1147,17 +1964,11 @@ export const SettingsView: React.FC = () => {
         {/* Navigation Sidebar */}
         <div className="sidebar">
           <div className="nav-list">
-            <button
-              onClick={() => setActiveTab('script')}
-              className={`nav-item ${activeTab === 'script' ? 'active' : ''}`}
-            >
-              <FileText className="w-4 h-4 flex-shrink-0" />
-              <span>{t.tabScript}</span>
-            </button>
-
+            <div className="nav-section-label">{t.navCopilotSection}</div>
             <button
               onClick={() => setActiveTab('copilot')}
               className={`nav-item ${activeTab === 'copilot' ? 'active' : ''}`}
+              aria-current={activeTab === 'copilot' ? 'page' : undefined}
             >
               <Bot className="w-4 h-4 flex-shrink-0" />
               <span>{t.tabCopilot}</span>
@@ -1166,14 +1977,27 @@ export const SettingsView: React.FC = () => {
             <button
               onClick={() => setActiveTab('audio-context')}
               className={`nav-item ${activeTab === 'audio-context' ? 'active' : ''}`}
+              aria-current={activeTab === 'audio-context' ? 'page' : undefined}
             >
               <Mic className="w-4 h-4 flex-shrink-0" />
               <span>{t.tabAudioContext}</span>
             </button>
 
+            <div className="nav-section-label">{t.navTeleprompterSection}</div>
+            <button
+              onClick={() => setActiveTab('script')}
+              className={`nav-item ${activeTab === 'script' ? 'active' : ''}`}
+              aria-current={activeTab === 'script' ? 'page' : undefined}
+            >
+              <FileText className="w-4 h-4 flex-shrink-0" />
+              <span>{t.tabScript}</span>
+            </button>
+
+            <div className="nav-section-label">{t.navGeneralSection}</div>
             <button
               onClick={() => setActiveTab('appearance')}
               className={`nav-item ${activeTab === 'appearance' ? 'active' : ''}`}
+              aria-current={activeTab === 'appearance' ? 'page' : undefined}
             >
               <Sliders className="w-4 h-4 flex-shrink-0" />
               <span>{t.tabAppearance}</span>
@@ -1182,6 +2006,7 @@ export const SettingsView: React.FC = () => {
             <button
               onClick={() => setActiveTab('position')}
               className={`nav-item ${activeTab === 'position' ? 'active' : ''}`}
+              aria-current={activeTab === 'position' ? 'page' : undefined}
             >
               <Move className="w-4 h-4 flex-shrink-0" />
               <span>{t.tabPosition}</span>
@@ -1190,6 +2015,7 @@ export const SettingsView: React.FC = () => {
             <button
               onClick={() => setActiveTab('hotkeys')}
               className={`nav-item ${activeTab === 'hotkeys' ? 'active' : ''}`}
+              aria-current={activeTab === 'hotkeys' ? 'page' : undefined}
             >
               <Keyboard className="w-4 h-4 flex-shrink-0" />
               <span>{t.tabHotkeys}</span>
@@ -1272,6 +2098,17 @@ export const SettingsView: React.FC = () => {
                 <p className="panel-subtitle">{t.copilotSubheading}</p>
               </div>
 
+              {renderReadinessPanel()}
+
+              <details className="advanced-settings">
+                <summary>
+                  <div>
+                    <strong>{t.advancedSettingsHeading}</strong>
+                    <span>{t.advancedSettingsHint}</span>
+                  </div>
+                  <ChevronDown aria-hidden="true" />
+                </summary>
+                <div className="advanced-settings-content">
               {/* Step 1: LLM Provider & Connection */}
               <div className="card-box">
                 <div className="card-title justify-between">
@@ -1279,7 +2116,7 @@ export const SettingsView: React.FC = () => {
                     <Bot className="w-4 h-4 text-blue-400 flex-shrink-0" />
                     <span>{t.presetProviderLabel}</span>
                   </div>
-                  <div className="flex items-center gap-1.5">
+                  <div className="provider-presets flex items-center gap-1.5">
                     {LLM_ENDPOINT_PRESETS.map((preset) => {
                       const isActive =
                         settings.llmProvider === preset.provider &&
@@ -1293,9 +2130,19 @@ export const SettingsView: React.FC = () => {
                               llmBaseUrl: preset.baseUrl,
                               llmModel: preset.defaultModel
                             };
-                            setSettings((prev) => ({ ...prev, ...updated }));
-                            window.electronAPI?.saveSettings(updated);
+                            settingsGenerationRef.current += 1;
+                            setSettings((prev) => {
+                              const next = { ...prev, ...updated };
+                              llmConfigSignatureRef.current = getLlmConfigSignature(next);
+                              return next;
+                            });
+                            llmTestGenerationRef.current += 1;
+                            setLlmTestResult(null);
+                            setLaunchBlockers([]);
+                            const save = window.electronAPI?.saveSettings(updated);
+                            if (save) void save.then(() => refreshReadiness());
                           }}
+                          aria-pressed={isActive}
                           className={`px-2 py-1 text-[11px] font-medium rounded border transition-colors cursor-pointer whitespace-nowrap ${
                             isActive
                               ? 'bg-blue-600/20 text-blue-300 border-blue-500/60'
@@ -1309,10 +2156,25 @@ export const SettingsView: React.FC = () => {
                   </div>
                 </div>
 
+                <div className="space-y-1">
+                  <label className="control-label block">{t.providerProtocolLabel}</label>
+                  <select
+                    value={settings.llmProvider}
+                    onChange={(event) =>
+                      updateSetting('llmProvider', event.target.value as LLMProvider)
+                    }
+                    className="form-select"
+                  >
+                    <option value="anthropic">{t.providerProtocolAnthropic}</option>
+                    <option value="openai-compatible">{t.providerProtocolOpenAI}</option>
+                  </select>
+                  <p className="control-desc">{t.providerProtocolHint}</p>
+                </div>
+
                 {/* Base URL + Test Connection */}
                 <div className="space-y-1">
                   <label className="control-label block">{t.customBaseUrlLabel}</label>
-                  <div className="flex items-center gap-2">
+                  <div className="llm-url-row flex items-center gap-2">
                     <input
                       type="text"
                       value={settings.llmBaseUrl}
@@ -1349,7 +2211,7 @@ export const SettingsView: React.FC = () => {
                 </div>
 
                 {/* Model + API Key in 2 columns */}
-                <div className="grid grid-cols-2 gap-3">
+                <div className="copilot-field-grid grid grid-cols-2 gap-3">
                   <div className="space-y-1">
                     <label className="control-label block">{t.modelLabel}</label>
                     <input
@@ -1381,7 +2243,7 @@ export const SettingsView: React.FC = () => {
                   <span>{t.triggerModeLabel}</span>
                 </div>
 
-                <div className="grid grid-cols-3 gap-2.5">
+                <div className="copilot-trigger-grid grid grid-cols-3 gap-2.5">
                   {[
                     {
                       id: 'both',
@@ -1404,6 +2266,7 @@ export const SettingsView: React.FC = () => {
                       onClick={() =>
                         updateSetting('copilotTriggerMode', item.id as CopilotTriggerMode)
                       }
+                      aria-pressed={settings.copilotTriggerMode === item.id}
                       className={`preset-card ${
                         settings.copilotTriggerMode === item.id ? 'active' : ''
                       }`}
@@ -1413,6 +2276,36 @@ export const SettingsView: React.FC = () => {
                     </button>
                   ))}
                 </div>
+
+                {settings.copilotTriggerMode !== 'hotkey' && (
+                  <div className="space-y-2 pt-2.5 border-t border-[#1e2433]">
+                    <div className="control-row">
+                      <div className="pr-4">
+                        <label className="control-label block" htmlFor="copilot-review-delay">
+                          {t.reviewDelayLabel}
+                        </label>
+                        <span className="control-desc">{t.reviewDelayHint}</span>
+                      </div>
+                      <span className="control-value">
+                        {t.reviewDelaySeconds.replace(
+                          '{seconds}',
+                          String(Math.round(settings.copilotReviewDelayMs / 1000))
+                        )}
+                      </span>
+                    </div>
+                    <input
+                      id="copilot-review-delay"
+                      type="range"
+                      min="2"
+                      max="10"
+                      step="1"
+                      value={Math.round(settings.copilotReviewDelayMs / 1000)}
+                      onChange={(event) =>
+                        updateSetting('copilotReviewDelayMs', Number(event.target.value) * 1000)
+                      }
+                    />
+                  </div>
+                )}
 
                 {/* Compact Overlay HUD Toggle */}
                 <div className="control-row pt-2.5 border-t border-[#1e2433]">
@@ -1450,9 +2343,9 @@ export const SettingsView: React.FC = () => {
                   </div>
 
                   {/* Quick Opacity Presets */}
-                  <div className="flex items-center gap-2">
+                  <div className="opacity-presets flex items-center gap-2">
                     {[
-                      { val: 0, label: '0% (Glass)' },
+                      { val: 0, label: `0% · ${t.bgOpacityTransparent}` },
                       { val: 0.15, label: '15%' },
                       { val: 0.35, label: '35%' },
                       { val: 0.65, label: '65%' },
@@ -1462,6 +2355,9 @@ export const SettingsView: React.FC = () => {
                       <button
                         key={preset.val}
                         onClick={() => updateSetting('copilotOpacity', preset.val)}
+                        aria-pressed={
+                          Math.abs((settings.copilotOpacity ?? 0.85) - preset.val) < 0.05
+                        }
                         className={`flex-1 py-1.5 px-2 text-[11px] font-medium rounded-md border transition-colors cursor-pointer ${
                           Math.abs((settings.copilotOpacity ?? 0.85) - preset.val) < 0.05
                             ? 'bg-[#2563eb] text-white border-blue-400'
@@ -1503,6 +2399,8 @@ export const SettingsView: React.FC = () => {
                 />
                 <p className="control-desc">{t.systemPromptHint}</p>
               </div>
+                </div>
+              </details>
             </div>
           )}
 
@@ -1565,10 +2463,10 @@ export const SettingsView: React.FC = () => {
                       onChange={(e) => updateSetting('micDeviceId', e.target.value)}
                       className="form-select"
                     >
-                      <option value="">Default Microphone</option>
-                      {availableMics.map((mic) => (
+                      <option value="default">{t.defaultMicrophoneLabel}</option>
+                      {availableMics.map((mic, index) => (
                         <option key={mic.deviceId} value={mic.deviceId}>
-                          {mic.label}
+                          {mic.label || `${t.permissionMicLabel} ${index + 1}`}
                         </option>
                       ))}
                     </select>
@@ -1583,25 +2481,31 @@ export const SettingsView: React.FC = () => {
                   <span>{t.sttEngineHeading}</span>
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="stt-provider-grid grid grid-cols-2 gap-3">
                   <button
-                    onClick={() => updateSetting('sttProvider', 'local-whisper')}
+                    onClick={() =>
+                      updateSetting('sttProvider', 'local-whisper')
+                    }
+                    aria-pressed={settings.sttProvider === 'local-whisper'}
                     className={`preset-card ${
                       settings.sttProvider === 'local-whisper' ? 'active' : ''
                     }`}
                   >
                     <div className="preset-card-title">{t.sttEngineLocal}</div>
-                    <div className="preset-card-desc">Built-in ONNX Whisper, zero API cost</div>
+                    <div className="preset-card-desc">{t.sttLocalDesc}</div>
                   </button>
 
                   <button
-                    onClick={() => updateSetting('sttProvider', 'cloud-whisper')}
+                    onClick={() =>
+                      updateSetting('sttProvider', 'cloud-whisper')
+                    }
+                    aria-pressed={settings.sttProvider === 'cloud-whisper'}
                     className={`preset-card ${
                       settings.sttProvider === 'cloud-whisper' ? 'active' : ''
                     }`}
                   >
                     <div className="preset-card-title">{t.sttEngineCloud}</div>
-                    <div className="preset-card-desc">Cloud Whisper API via URL</div>
+                    <div className="preset-card-desc">{t.sttCloudDesc}</div>
                   </button>
                 </div>
 
@@ -1613,10 +2517,10 @@ export const SettingsView: React.FC = () => {
                     onChange={(e) => updateSetting('sttLanguage', e.target.value as STTLanguage)}
                     className="form-select"
                   >
-                    <option value="auto">Auto-detect (RU / EN / UK)</option>
-                    <option value="ru">Русский (Russian)</option>
-                    <option value="en">English</option>
-                    <option value="uk">Українська (Ukrainian)</option>
+                    <option value="auto">{t.sttLanguageAuto}</option>
+                    <option value="ru">{t.sttLanguageRussian}</option>
+                    <option value="en">{t.sttLanguageEnglish}</option>
+                    <option value="uk">{t.sttLanguageUkrainian}</option>
                   </select>
                 </div>
 
@@ -1624,65 +2528,90 @@ export const SettingsView: React.FC = () => {
                 {settings.sttProvider === 'local-whisper' && (
                   <div className="space-y-3 pt-2 border-t border-[#1e2433]">
                     <label className="control-label block">{t.localModelsLabel}</label>
-                    <div className="space-y-2">
+                    <div className="model-list">
                       {whisperModels.map((m) => {
                         const isSelected = settings.localWhisperModel === m.id;
-                        const isDownloading =
-                          isDownloadingModel && downloadProgress?.modelId === m.id;
+                        const modelProgress = downloadProgress?.modelId === m.id ? downloadProgress : null;
+                        const modelStatus = m.status ?? (m.downloaded ? 'ready' : 'missing');
+                        const isInProgress =
+                          modelStatus === 'loading' ||
+                          modelProgress?.status === 'downloading' ||
+                          modelProgress?.status === 'validating';
+                        const canCancelDownload = modelProgress?.status === 'downloading';
+                        const effectiveStatus: NonNullable<WhisperModelInfo['status']> =
+                          modelProgress?.status === 'error'
+                            ? 'error'
+                            : isInProgress
+                              ? 'loading'
+                              : isWhisperModelReady(m)
+                                ? 'ready'
+                                : modelStatus;
 
                         return (
                           <div
                             key={m.id}
-                            className={`p-3 rounded-lg border transition-all flex items-center justify-between ${
-                              isSelected
-                                ? 'bg-[#1a202d] border-blue-500/80 text-white'
-                                : 'bg-[#141822] border-[#252d3d] text-slate-300'
-                            }`}
+                            className={`model-option ${isSelected ? 'is-selected' : ''}`}
                           >
-                            <div
-                              className="cursor-pointer flex-1"
-                              onClick={() =>
-                                updateSetting('localWhisperModel', m.id as LocalWhisperModelId)
-                              }
+                            <button
+                              type="button"
+                              className="model-option-main"
+                              onClick={() => updateSetting('localWhisperModel', m.id)}
+                              aria-pressed={isSelected}
                             >
-                              <div className="flex items-center space-x-2">
-                                <span className="text-xs font-semibold">{m.name}</span>
-                                <span className="text-[10px] bg-[#252d3d] text-slate-300 px-1.5 py-0.5 rounded">
-                                  {m.sizeLabel}
+                              <div className="model-option-heading">
+                                <strong>{getWhisperName(m.id, t)}</strong>
+                                <span className="model-size">{m.sizeLabel}</span>
+                                <span className={`model-status status-${effectiveStatus}`}>
+                                  {effectiveStatus === 'ready' && <Check aria-hidden="true" />}
+                                  {effectiveStatus === 'loading' && (
+                                    <LoaderCircle className="animate-spin" aria-hidden="true" />
+                                  )}
+                                  {(effectiveStatus === 'partial' || effectiveStatus === 'error') && (
+                                    <AlertCircle aria-hidden="true" />
+                                  )}
+                                  {getModelStatusLabel(effectiveStatus)}
                                 </span>
-                                {m.downloaded && (
-                                  <span className="text-[10px] text-emerald-400 font-medium flex items-center space-x-1">
-                                    <Check className="w-3 h-3" />
-                                    <span>{t.modelReady}</span>
-                                  </span>
-                                )}
                               </div>
-                              <p className="text-[11px] text-slate-400 mt-1">{m.description}</p>
-                            </div>
+                              <p>{getWhisperDescription(m.id, t)}</p>
+                            </button>
 
-                            <div className="ml-3">
-                              {m.downloaded ? (
+                            <div className="model-option-actions">
+                              {isInProgress ? (
                                 <button
-                                  onClick={() =>
-                                    updateSetting('localWhisperModel', m.id as LocalWhisperModelId)
-                                  }
-                                  className={`btn-secondary text-[11px] ${
-                                    isSelected ? 'bg-blue-600 text-white border-blue-500' : ''
-                                  }`}
+                                  type="button"
+                                  onClick={() => void handleCancelModelDownload(m.id)}
+                                  className="btn-secondary"
+                                  disabled={!canCancelDownload}
                                 >
-                                  {isSelected ? 'Active' : 'Select'}
+                                  <X aria-hidden="true" />
+                                  <span>{canCancelDownload ? t.cancelButton : t.validatingModel}</span>
+                                </button>
+                              ) : effectiveStatus === 'ready' ? (
+                                <button
+                                  type="button"
+                                  onClick={() => updateSetting('localWhisperModel', m.id)}
+                                  className={`btn-secondary ${isSelected ? 'is-selected' : ''}`}
+                                  disabled={isSelected}
+                                >
+                                  <Check aria-hidden="true" />
+                                  <span>{isSelected ? t.selectedModelButton : t.selectModelButton}</span>
                                 </button>
                               ) : (
                                 <button
-                                  onClick={() =>
-                                    handleDownloadModel(m.id as LocalWhisperModelId)
-                                  }
+                                  type="button"
+                                  onClick={() => void handleDownloadModel(m.id)}
                                   disabled={isDownloadingModel}
-                                  className="btn-secondary text-[11px] text-blue-400 border-blue-500/40 hover:bg-blue-900/30"
+                                  className="btn-secondary"
                                 >
-                                  <Download className="w-3 h-3" />
+                                  {effectiveStatus === 'error' || effectiveStatus === 'partial' ? (
+                                    <RotateCcw aria-hidden="true" />
+                                  ) : (
+                                    <Download aria-hidden="true" />
+                                  )}
                                   <span>
-                                    {isDownloading ? `${downloadProgress?.progress}%` : t.downloadModelButton}
+                                    {effectiveStatus === 'error' || effectiveStatus === 'partial'
+                                      ? t.retryButton
+                                      : t.downloadModelButton}
                                   </span>
                                 </button>
                               )}
@@ -1692,20 +2621,70 @@ export const SettingsView: React.FC = () => {
                       })}
                     </div>
 
-                    {downloadProgress && downloadProgress.status === 'downloading' && (
-                      <div className="space-y-1 p-2 bg-[#1a202d] rounded border border-[#252d3d]">
-                        <div className="flex justify-between text-[11px] text-slate-300">
+                    {downloadProgress &&
+                      (downloadProgress.status === 'downloading' ||
+                        downloadProgress.status === 'validating') && (
+                      <div className="model-progress">
+                        <div className="model-progress-copy">
                           <span>
-                            {t.downloadingModel}: {downloadProgress.file || 'ONNX weights'}
+                            {downloadProgress.status === 'validating'
+                              ? t.validatingModel
+                              : `${t.downloadingModel}: ${downloadProgress.file || t.modelProgressFallback}`}
                           </span>
                           <span>{downloadProgress.progress}%</span>
                         </div>
-                        <div className="w-full bg-[#252d3d] h-1.5 rounded overflow-hidden">
+                        <div
+                          className="model-progress-track"
+                          role="progressbar"
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={downloadProgress.progress}
+                        >
                           <div
-                            className="bg-blue-500 h-full transition-all duration-200"
+                            className="model-progress-value"
                             style={{ width: `${downloadProgress.progress}%` }}
                           />
                         </div>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => void handleCancelModelDownload(downloadProgress.modelId)}
+                          disabled={downloadProgress.status !== 'downloading'}
+                        >
+                          <X aria-hidden="true" />
+                          <span>
+                            {downloadProgress.status === 'downloading'
+                              ? t.cancelButton
+                              : t.validatingModel}
+                          </span>
+                        </button>
+                      </div>
+                    )}
+
+                    {downloadProgress?.status === 'cancelled' && (
+                      <div className="model-cancelled" role="status">
+                        {t.modelDownloadCancelled}
+                      </div>
+                    )}
+
+                    {downloadProgress && downloadProgress.status === 'error' && (
+                      <div className="p-2.5 bg-red-950/40 border border-red-500/40 rounded text-red-300 text-xs flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                        <div className="flex-1">
+                          <div className="font-semibold">{t.modelDownloadErrorHeading}</div>
+                          <div className="text-[11px] text-red-400/90 mt-0.5">
+                            {downloadProgress.error || t.modelDownloadErrorFallback}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => void handleDownloadModel(downloadProgress.modelId)}
+                          disabled={isDownloadingModel}
+                        >
+                          <RotateCcw aria-hidden="true" />
+                          <span>{t.retryButton}</span>
+                        </button>
                       </div>
                     )}
                   </div>
@@ -1730,7 +2709,17 @@ export const SettingsView: React.FC = () => {
                         type="password"
                         value={settings.cloudSttApiKey}
                         onChange={(e) => updateSetting('cloudSttApiKey', e.target.value)}
-                        placeholder="Leave blank to reuse LLM API Key"
+                        placeholder={t.cloudSttKeyPlaceholder}
+                        className="form-input"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="control-label">{t.cloudSttModelLabel}</label>
+                      <input
+                        type="text"
+                        value={settings.cloudSttModel}
+                        onChange={(e) => updateSetting('cloudSttModel', e.target.value)}
+                        placeholder="whisper-1"
                         className="form-input"
                       />
                     </div>
@@ -1849,16 +2838,16 @@ export const SettingsView: React.FC = () => {
                     <div>
                       <span className="control-label">{t.bgOpacityLabel}</span>
                       <span className="control-desc block">
-                        {settings.bgOpacity === 0 ? '100% Glass (Only text floats on screen)' : ''}
+                        {settings.bgOpacity === 0 ? t.bgOpacityTransparent : ''}
                       </span>
                     </div>
                     <span className="control-value">{Math.round(settings.bgOpacity * 100)}%</span>
                   </div>
 
                   {/* Quick Opacity Presets */}
-                  <div className="flex items-center gap-2">
+                  <div className="opacity-presets flex items-center gap-2">
                     {[
-                      { val: 0, label: '0% (Glass)' },
+                      { val: 0, label: `0% · ${t.bgOpacityTransparent}` },
                       { val: 0.15, label: '15%' },
                       { val: 0.35, label: '35%' },
                       { val: 0.65, label: '65%' },
@@ -1867,6 +2856,7 @@ export const SettingsView: React.FC = () => {
                       <button
                         key={preset.val}
                         onClick={() => updateSetting('bgOpacity', preset.val)}
+                        aria-pressed={Math.abs(settings.bgOpacity - preset.val) < 0.05}
                         className={`flex-1 py-1.5 px-2 text-[11px] font-medium rounded-md border transition-colors cursor-pointer ${
                           Math.abs(settings.bgOpacity - preset.val) < 0.05
                             ? 'bg-[#2563eb] text-white border-blue-400'
@@ -1906,9 +2896,9 @@ export const SettingsView: React.FC = () => {
                   </div>
 
                   {/* Quick Opacity Presets */}
-                  <div className="flex items-center gap-2">
+                  <div className="opacity-presets flex items-center gap-2">
                     {[
-                      { val: 0, label: '0% (Glass)' },
+                      { val: 0, label: `0% · ${t.bgOpacityTransparent}` },
                       { val: 0.15, label: '15%' },
                       { val: 0.35, label: '35%' },
                       { val: 0.65, label: '65%' },
@@ -1918,6 +2908,9 @@ export const SettingsView: React.FC = () => {
                       <button
                         key={preset.val}
                         onClick={() => updateSetting('copilotOpacity', preset.val)}
+                        aria-pressed={
+                          Math.abs((settings.copilotOpacity ?? 0.85) - preset.val) < 0.05
+                        }
                         className={`flex-1 py-1.5 px-2 text-[11px] font-medium rounded-md border transition-colors cursor-pointer ${
                           Math.abs((settings.copilotOpacity ?? 0.85) - preset.val) < 0.05
                             ? 'bg-[#2563eb] text-white border-blue-400'
@@ -2092,6 +3085,7 @@ export const SettingsView: React.FC = () => {
                     <button
                       key={p.id}
                       onClick={() => handlePresetChange(p.id as PresetPosition)}
+                      aria-pressed={settings.presetPosition === p.id}
                       className={`preset-card ${settings.presetPosition === p.id ? 'active' : ''}`}
                     >
                       <div className="preset-card-title">{p.label}</div>

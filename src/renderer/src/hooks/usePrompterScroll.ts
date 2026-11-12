@@ -55,16 +55,7 @@ export function usePrompterScroll({
 
   const adjustSpeed = useCallback(
     (delta: number) => {
-      if (!enabled) {
-        // In AI Copilot mode, ⌃⌥⌘↑ / ↓ scrolls the AI answer manually instead of changing teleprompter speed
-        if (containerRef.current) {
-          containerRef.current.scrollBy({
-            top: delta > 0 ? -90 : 90,
-            behavior: 'smooth'
-          });
-        }
-        return;
-      }
+      if (!enabled) return;
       setSpeed((prev) => {
         const next = Math.max(10, Math.min(300, prev + delta));
         showTemporaryHud(`⚡ ${next} PX/S`);

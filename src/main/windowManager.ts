@@ -34,10 +34,12 @@ export class WindowManager {
     this.settingsWindow = new BrowserWindow({
       width: 1020,
       height: 740,
-      resizable: false,
-      maximizable: false,
+      minWidth: 860,
+      minHeight: 620,
+      resizable: true,
+      maximizable: true,
       fullscreenable: false,
-      title: 'Cyrano — Teleprompter & AI Copilot',
+      title: 'Cyrano — AI Copilot & Teleprompter',
       titleBarStyle: isMac ? 'hiddenInset' : 'default',
       trafficLightPosition: isMac ? { x: 16, y: 16 } : undefined,
       autoHideMenuBar: true,
@@ -101,8 +103,8 @@ export class WindowManager {
     // Dedicated geometry for AI Copilot HUD Window (Cyrano floating overlay)
     if (settings.appMode === 'copilot') {
       const isCompact = Boolean(settings.copilotCompact);
-      const width = isCompact ? 580 : 740;
-      const height = isCompact ? 300 : 480;
+      let width = Math.min(isCompact ? 720 : 860, dispW - 32);
+      let height = Math.min(isCompact ? 360 : 560, dispH - 32);
 
       let x = dispX + Math.round((dispW - width) / 2);
       let y = dispY + 14;
@@ -120,8 +122,22 @@ export class WindowManager {
           x = dispX + Math.round((dispW - width) / 2);
           y = dispY + Math.round((dispH - height) / 2);
           break;
-        case 'top-center':
         case 'top-full':
+          width = Math.round(dispW * 0.92);
+          x = dispX + Math.round((dispW - width) / 2);
+          y = dispY + 12;
+          break;
+        case 'custom':
+          width = Math.max(480, Math.min(settings.width || width, dispW - 32));
+          height = Math.max(280, Math.min(settings.height || height, dispH - 32));
+          x = settings.xPosition < 0
+            ? dispX + Math.round((dispW - width) / 2)
+            : Math.max(dispX, Math.min(settings.xPosition, dispX + dispW - width));
+          y = settings.yPosition < 0
+            ? dispY + 14
+            : Math.max(dispY, Math.min(settings.yPosition, dispY + dispH - height));
+          break;
+        case 'top-center':
         default:
           x = dispX + Math.round((dispW - width) / 2);
           y = dispY + 14;
@@ -194,9 +210,13 @@ export class WindowManager {
     if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
       this.overlayWindow.setBounds(bounds);
       this.overlayWindow.setMovable(false);
-      this.overlayWindow.setFocusable(false);
-      // Cyrano stealth: completely click-through, mouse clicks pass directly to underlying apps
-      this.overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+      this.overlayWindow.setFocusable(
+        process.platform === 'linux' && settings.appMode === 'copilot'
+      );
+      // Re-assert screen capture exclusion (WDA_EXCLUDEFROMCAPTURE / NSWindowSharingNone)
+      this.overlayWindow.setContentProtection(true);
+      const keepCopilotInteractive = process.platform === 'linux' && settings.appMode === 'copilot';
+      this.overlayWindow.setIgnoreMouseEvents(!keepCopilotInteractive, { forward: true });
       return this.overlayWindow;
     }
 
@@ -213,10 +233,10 @@ export class WindowManager {
       hasShadow: false,
       resizable: false,
       movable: false,
-      focusable: false,
+      focusable: process.platform === 'linux' && settings.appMode === 'copilot',
       skipTaskbar: true,     // Exclude from taskbar (Windows & Linux)
       show: false,
-      type: isMac ? 'panel' : 'toolbar', // NSPanel on macOS, toolbar on Windows (hides from Alt+Tab)
+      type: isMac ? 'panel' : undefined, // Standard frameless on Windows to ensure DWM respects SetWindowDisplayAffinity
       webPreferences: {
         preload: this.getPreloadPath(),
         contextIsolation: true,
@@ -229,6 +249,19 @@ export class WindowManager {
     // 1. OBS / Screen Share Invisibility:
     // Sets NSWindowSharingNone on macOS and WDA_EXCLUDEFROMCAPTURE on Windows 10/11
     this.overlayWindow.setContentProtection(true);
+
+    // Re-assert content protection on show and ready-to-show events because
+    // Windows DWM can reset window display affinity upon show / state transitions
+    this.overlayWindow.on('show', () => {
+      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
+        this.overlayWindow.setContentProtection(true);
+      }
+    });
+    this.overlayWindow.once('ready-to-show', () => {
+      if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
+        this.overlayWindow.setContentProtection(true);
+      }
+    });
 
     // 2. High window level: stays above full-screen apps and presentations
     this.overlayWindow.setAlwaysOnTop(true, 'screen-saver', 1);
@@ -244,7 +277,8 @@ export class WindowManager {
     // In both Teleprompter and AI Copilot modes, the window is click-through (Cyrano model).
     // Mouse clicks pass through seamlessly to Zoom, IDE, browser, presentations.
     // All control is driven by global hotkeys.
-    this.overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+    const keepCopilotInteractive = process.platform === 'linux' && settings.appMode === 'copilot';
+    this.overlayWindow.setIgnoreMouseEvents(!keepCopilotInteractive, { forward: true });
 
     this.overlayWindow.loadURL(this.getAppUrl('/overlay'));
 
@@ -282,12 +316,20 @@ export class WindowManager {
 
     // Show overlay without taking focus away from whatever app user is in
     overlay.showInactive();
+
+    // Re-assert content protection immediately and after next DWM composition tick
+    overlay.setContentProtection(true);
+    setTimeout(() => {
+      if (overlay && !overlay.isDestroyed()) {
+        overlay.setContentProtection(true);
+      }
+    }, 100);
   }
 
   public stopPrompter(): void {
     this.isPrompterActive = false;
 
-    // Destroy overlay window so all ScreenCaptureKit screen recording and WebAudio sessions release immediately
+    // Destroy overlay window so native system-audio and WebAudio sessions release immediately.
     if (this.overlayWindow && !this.overlayWindow.isDestroyed()) {
       try {
         this.overlayWindow.destroy();

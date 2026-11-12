@@ -3,7 +3,7 @@
 Invisible desktop teleprompter for macOS with ScreenCaptureKit bypass, true AppKit transparency, and unobtrusive floating overlay.
 
 ## Tech Stack
-- **Framework**: Electron 33.2.1 + Node.js 20
+- **Framework**: Electron 45.3.0 + Node.js 24
 - **UI & View**: React 18.3.1, TypeScript 5.7.2, Lucide React
 - **Build Pipeline**: Vite 5.4.11, esbuild, electron-builder 25.1.8
 - **Platform APIs**: macOS AppKit (`NSWindowSharingNone`, `setIgnoreMouseEvents`, `dock.hide`)

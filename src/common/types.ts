@@ -26,11 +26,39 @@ export type STTLanguage = 'auto' | 'ru' | 'en' | 'uk';
 
 export type AudioSourceType = 'system' | 'mic';
 
+export type CopilotSessionPhase =
+  | 'idle'
+  | 'awaiting-audio-permission'
+  | 'listening'
+  | 'capturing'
+  | 'transcribing'
+  | 'reviewing-question'
+  | 'answering'
+  | 'paused'
+  | 'error';
+
+export type CopilotErrorCode =
+  | 'AUDIO_PERMISSION_DENIED'
+  | 'SYSTEM_AUDIO_NO_TRACK'
+  | 'SYSTEM_AUDIO_NO_SIGNAL'
+  | 'MODEL_INCOMPLETE'
+  | 'MODEL_NATIVE_RUNTIME_MISSING'
+  | 'STT_BACKLOG_LIMIT'
+  | 'TRANSCRIPTION_FAILED'
+  | 'LLM_UNAUTHORIZED'
+  | 'LLM_EMPTY_RESPONSE'
+  | 'LLM_REQUEST_FAILED'
+  | 'PROJECT_INDEX_STALE'
+  | 'UNKNOWN';
+
 export interface TranscriptEntry {
   id: string;
   source: AudioSourceType;
   text: string;
   timestamp: number;
+  sequence?: number;
+  startedAt?: number;
+  endedAt?: number;
 }
 
 export interface WhisperModelInfo {
@@ -39,14 +67,87 @@ export interface WhisperModelInfo {
   sizeLabel: string;
   description: string;
   downloaded: boolean;
+  selected?: boolean;
+  status?: 'missing' | 'partial' | 'ready' | 'loading' | 'error';
+  error?: string;
 }
 
 export interface WhisperDownloadProgress {
   modelId: LocalWhisperModelId;
-  status: 'downloading' | 'ready' | 'error';
+  status: 'downloading' | 'validating' | 'ready' | 'cancelled' | 'error';
   progress: number;
   file?: string;
   error?: string;
+}
+
+export interface CopilotCitation {
+  id: string;
+  relativePath: string;
+  startLine: number;
+  endLine: number;
+  label: string;
+}
+
+export interface CopilotQuestionCandidate {
+  id: string;
+  text: string;
+  source: 'system' | 'manual';
+  createdAt: number;
+  reviewEndsAt: number;
+  transcriptEntryIds: string[];
+}
+
+export interface CopilotRequestContext {
+  sessionId: string;
+  generation: number;
+}
+
+export interface CopilotSessionError {
+  code: CopilotErrorCode;
+  message: string;
+  recoverable: boolean;
+}
+
+export interface CopilotAudioStatus {
+  systemEnabled: boolean;
+  systemActive: boolean;
+  systemSpeaking: boolean;
+  micEnabled: boolean;
+  micActive: boolean;
+  micSpeaking: boolean;
+  audioLevel: number;
+  queueDepth: number;
+}
+
+export interface CopilotSessionSnapshot {
+  sessionId: string;
+  generation: number;
+  phase: CopilotSessionPhase;
+  transcript: TranscriptEntry[];
+  pendingQuestion?: CopilotQuestionCandidate;
+  activeRequestId?: string;
+  activeQuestion?: string;
+  answer: string;
+  citations: CopilotCitation[];
+  audio: CopilotAudioStatus;
+  error?: CopilotSessionError;
+  updatedAt: number;
+}
+
+export type CopilotReadinessItemId = 'llm' | 'audio' | 'stt' | 'project';
+export type CopilotReadinessStatus = 'checking' | 'ready' | 'warning' | 'blocked';
+
+export interface CopilotReadinessItem {
+  id: CopilotReadinessItemId;
+  status: CopilotReadinessStatus;
+  title: string;
+  detail: string;
+}
+
+export interface CopilotReadiness {
+  ready: boolean;
+  items: CopilotReadinessItem[];
+  checkedAt: number;
 }
 
 export interface ContextFolderStats {
@@ -59,11 +160,43 @@ export interface ContextFolderStats {
 
 export interface CopilotAnswerEvent {
   requestId: string;
+  sessionId?: string;
+  questionId?: string;
   status: 'idle' | 'thinking' | 'streaming' | 'done' | 'error';
   question?: string;
   delta?: string;
   fullText?: string;
+  citations?: CopilotCitation[];
   error?: string;
+}
+
+export interface TranscribeAudioPayload {
+  samples: Float32Array | number[];
+  source: AudioSourceType;
+  sessionId: string;
+  sessionGeneration: number;
+  sequence: number;
+  startedAt: number;
+  endedAt: number;
+}
+
+export interface TranscribeAudioResult {
+  text: string;
+  entry?: TranscriptEntry;
+  error?: string;
+  errorCode?: CopilotErrorCode;
+}
+
+export interface SystemAudioCaptureResult {
+  success: boolean;
+  unsupported?: boolean;
+  error?: string;
+}
+
+export interface SystemAudioPcmChunk {
+  data: Uint8Array;
+  sampleRate: number;
+  capturedAt: number;
 }
 
 export interface PrompterSettings {
@@ -115,6 +248,7 @@ export interface PrompterSettings {
   llmModel: string;
   llmSystemPrompt: string;
   copilotTriggerMode: CopilotTriggerMode;
+  copilotReviewDelayMs: number;
 
   // Audio & Speech-to-Text (STT)
   sttProvider: STTProvider;

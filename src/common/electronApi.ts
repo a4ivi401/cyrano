@@ -5,9 +5,16 @@ import {
   WhisperModelInfo,
   WhisperDownloadProgress,
   LocalWhisperModelId,
-  AudioSourceType,
   TranscriptEntry,
-  CopilotAnswerEvent
+  CopilotAnswerEvent,
+  CopilotAudioStatus,
+  CopilotRequestContext,
+  CopilotReadiness,
+  CopilotSessionSnapshot,
+  SystemAudioCaptureResult,
+  SystemAudioPcmChunk,
+  TranscribeAudioPayload,
+  TranscribeAudioResult
 } from '../common/types';
 
 export type PermissionState =
@@ -38,27 +45,51 @@ export interface IElectronAPI {
   requestPermission: (type: 'microphone' | 'accessibility') => Promise<boolean>;
   openSystemPreferences: (pane: 'screen' | 'microphone' | 'accessibility') => Promise<void>;
 
+  // Native system audio capture (macOS 14.2+)
+  startSystemAudioCapture: () => Promise<SystemAudioCaptureResult>;
+  stopSystemAudioCapture: () => Promise<void>;
+  onSystemAudioData: (callback: (chunk: SystemAudioPcmChunk) => void) => () => void;
+  onSystemAudioError: (callback: (message: string) => void) => () => void;
+
   // Project / Folder Context APIs
   selectContextFolder: () => Promise<ContextFolderStats | null>;
-  getContextStats: (folderPath?: string) => Promise<ContextFolderStats | null>;
+  clearContextFolder: () => Promise<PrompterSettings>;
+  getContextStats: () => Promise<ContextFolderStats | null>;
   refreshContextFolder: () => Promise<ContextFolderStats | null>;
 
   // Local Whisper & STT APIs
   getWhisperModels: () => Promise<WhisperModelInfo[]>;
-  downloadWhisperModel: (modelId: LocalWhisperModelId) => Promise<{ success: boolean; error?: string }>;
-  transcribeAudioChunk: (payload: {
-    samples: Float32Array | number[];
-    source: AudioSourceType;
-  }) => Promise<{ text: string; entry?: TranscriptEntry; error?: string }>;
+  downloadWhisperModel: (
+    modelId: LocalWhisperModelId
+  ) => Promise<{ success: boolean; cancelled?: boolean; error?: string }>;
+  cancelWhisperModelDownload: (modelId: LocalWhisperModelId) => Promise<{ success: boolean }>;
+  transcribeAudioChunk: (payload: TranscribeAudioPayload) => Promise<TranscribeAudioResult>;
 
   // LLM & Copilot APIs
   testLLMConnection: (override?: Partial<PrompterSettings>) => Promise<{ success: boolean; message: string }>;
   analyzeProjectWithAI: (override?: Partial<PrompterSettings>) => Promise<{ success: boolean; notes?: string; error?: string }>;
-  askCopilot: (customPrompt?: string) => Promise<{ requestId: string }>;
+  askCopilot: (
+    customPrompt?: string,
+    context?: CopilotRequestContext
+  ) => Promise<{ requestId: string }>;
   clearCopilotAnswer: () => Promise<void>;
   getTranscript: () => Promise<TranscriptEntry[]>;
   clearTranscript: () => Promise<void>;
+  getCopilotReadiness: () => Promise<CopilotReadiness>;
+  getCopilotSession: () => Promise<CopilotSessionSnapshot>;
+  startCopilotSession: () => Promise<CopilotSessionSnapshot>;
+  stopCopilotSession: () => Promise<CopilotSessionSnapshot>;
+  setCopilotPaused: (paused: boolean) => Promise<CopilotSessionSnapshot>;
+  recoverCopilotSession: () => Promise<CopilotSessionSnapshot>;
+  reportCopilotAudioStatus: (status: Partial<CopilotAudioStatus>) => Promise<void>;
+  confirmCopilotQuestion: (questionId: string) => Promise<{ success: boolean; requestId?: string }>;
+  cancelCopilotQuestion: (questionId: string) => Promise<{ success: boolean }>;
+  editCopilotQuestion: (
+    questionId: string,
+    text: string
+  ) => Promise<{ success: boolean }>;
   setIgnoreMouseEvents?: (ignore: boolean, options?: { forward: boolean }) => void;
+  setOverlayFocusable?: (focusable: boolean) => void;
 
   // Overlay & Settings Events
   onSettingsUpdated: (callback: (settings: PrompterSettings) => void) => () => void;
@@ -70,4 +101,5 @@ export interface IElectronAPI {
   onWhisperDownloadProgress: (callback: (progress: WhisperDownloadProgress) => void) => () => void;
   onTranscriptUpdated: (callback: (entries: TranscriptEntry[]) => void) => () => void;
   onCopilotAnswer: (callback: (event: CopilotAnswerEvent) => void) => () => void;
+  onCopilotSessionUpdated: (callback: (snapshot: CopilotSessionSnapshot) => void) => () => void;
 }

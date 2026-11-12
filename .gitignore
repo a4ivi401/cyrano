@@ -42,3 +42,9 @@ Icon
 # Temporary files
 *.tmp
 *.log
+
+# Pre-bundled models (generated via npm run download:model)
+resources/whisper-models/
+
+# Local design and UI verification artifacts
+.superpowers/
